@@ -46,10 +46,10 @@ static const char *TAG = "lvgl_app";
 #define LVGL_SCOPE_TRIGGER_POS  ((APP_ADC_CHART_POINTS - 1U) / 2U)
 
 /** @brief Cor do grupo de base de tempo. */
-#define LVGL_COLOR_TIMEBASE     0xEF4444
+#define LVGL_COLOR_TIMEBASE     0xFCA5A5
 
 /** @brief Cor do grupo de base de tensão. */
-#define LVGL_COLOR_VOLTS        0xF97316
+#define LVGL_COLOR_VOLTS        0xD8B4FE
 
 /** @brief Cor do grupo de seleção de canal amostrado. */
 #define LVGL_COLOR_CHANNEL      0xFB7185
@@ -74,6 +74,12 @@ static const char *TAG = "lvgl_app";
 
 /** @brief Cor do grupo de autoajuste. */
 #define LVGL_COLOR_AUTOSET      0x22C55E
+
+/** @brief Cor do traço do canal 1 no chart. */
+#define LVGL_COLOR_TRACE_CH1    0x39FF14
+
+/** @brief Cor do traço do canal 2 no chart. */
+#define LVGL_COLOR_TRACE_CH2    0x38BDF8
 
 /** @brief Distância máxima, em pixels, para capturar uma linha de cursor com o dedo. */
 #define LVGL_CURSOR_HIT_SLOP_PX (14)
@@ -407,6 +413,11 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer);
  * @brief Atualiza a linha e o label visuais do nível de trigger.
  */
 static void lvgl_update_trigger_level_visuals(void);
+
+/**
+ * @brief Atualiza as cores da faixa inferior conforme o canal exibido.
+ */
+static void lvgl_update_metric_strip_styles(void);
 
 /**
  * @brief Callback periódica que incrementa o tick interno do LVGL.
@@ -991,6 +1002,7 @@ static void lvgl_update_scope_layout(void)
 
     lv_obj_set_size(s_metrics_strip, ST7796_H_RES, dual_channel ? 50 : 25);
     lv_obj_align(s_metrics_strip, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lvgl_update_metric_strip_styles();
 
     if (s_rms_label_ch2 != NULL) {
         if (dual_channel) {
@@ -1004,6 +1016,13 @@ static void lvgl_update_scope_layout(void)
             lv_obj_remove_flag(s_pk_label_ch2, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(s_pk_label_ch2, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_pk_neg_label_ch2 != NULL) {
+        if (dual_channel) {
+            lv_obj_remove_flag(s_pk_neg_label_ch2, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_pk_neg_label_ch2, LV_OBJ_FLAG_HIDDEN);
         }
     }
     if (s_freq_label_ch2 != NULL) {
@@ -1157,9 +1176,9 @@ static void lvgl_style_dropdown(lv_obj_t *dropdown, lv_color_t accent_color)
 {
     lv_obj_t *list = lv_dropdown_get_list(dropdown);
 
-    lv_obj_set_style_bg_color(dropdown, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(dropdown, accent_color, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(dropdown, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_text_color(dropdown, lv_color_hex(0xF9FAFB), LV_PART_MAIN);
+    lv_obj_set_style_text_color(dropdown, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_border_color(dropdown, accent_color, LV_PART_MAIN);
     lv_obj_set_style_border_width(dropdown, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(dropdown, 6, LV_PART_MAIN);
@@ -1179,6 +1198,73 @@ static void lvgl_style_dropdown(lv_obj_t *dropdown, lv_color_t accent_color)
         lv_obj_set_style_text_color(list, lv_color_hex(0x000000), LV_PART_SELECTED);
         lv_obj_set_style_bg_color(list, lv_color_hex(0x111827), LV_PART_SCROLLBAR);
         lv_obj_set_style_bg_opa(list, LV_OPA_40, LV_PART_SCROLLBAR);
+    }
+}
+
+/**
+ * @brief Aplica o visual de fundo de uma métrica inferior com a cor do canal.
+ *
+ * @param[in] label Label da métrica a estilizar.
+ * @param[in] bg_color Cor de fundo associada ao canal.
+ */
+static void lvgl_style_metric_label(lv_obj_t *label, lv_color_t bg_color)
+{
+    lv_obj_set_width(label, lv_pct(100));
+    lv_obj_set_height(label, 23);
+    lv_obj_set_style_bg_color(label, bg_color, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(label, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_hex(0x020617), LV_PART_MAIN);
+    lv_obj_set_style_radius(label, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(label, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(label, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(label, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(label, 1, LV_PART_MAIN);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+}
+
+/**
+ * @brief Atualiza as cores da faixa inferior conforme o canal exibido.
+ */
+static void lvgl_update_metric_strip_styles(void)
+{
+    lv_color_t primary_color = lv_color_hex(LVGL_COLOR_TRACE_CH1);
+    lv_color_t secondary_color = lv_color_hex(LVGL_COLOR_TRACE_CH2);
+
+    if (s_sample_channel_mode == 1U) {
+        primary_color = lv_color_hex(LVGL_COLOR_TRACE_CH2);
+    }
+
+    if (s_rms_label != NULL) {
+        lvgl_style_metric_label(s_rms_label, primary_color);
+    }
+    if (s_pk_label != NULL) {
+        lvgl_style_metric_label(s_pk_label, primary_color);
+    }
+    if (s_pk_neg_label != NULL) {
+        lvgl_style_metric_label(s_pk_neg_label, primary_color);
+    }
+    if (s_freq_label != NULL) {
+        lvgl_style_metric_label(s_freq_label, primary_color);
+    }
+    if (s_duty_label != NULL) {
+        lvgl_style_metric_label(s_duty_label, primary_color);
+    }
+
+    if (s_rms_label_ch2 != NULL) {
+        lvgl_style_metric_label(s_rms_label_ch2, secondary_color);
+    }
+    if (s_pk_label_ch2 != NULL) {
+        lvgl_style_metric_label(s_pk_label_ch2, secondary_color);
+    }
+    if (s_pk_neg_label_ch2 != NULL) {
+        lvgl_style_metric_label(s_pk_neg_label_ch2, secondary_color);
+    }
+    if (s_freq_label_ch2 != NULL) {
+        lvgl_style_metric_label(s_freq_label_ch2, secondary_color);
+    }
+    if (s_duty_label_ch2 != NULL) {
+        lvgl_style_metric_label(s_duty_label_ch2, secondary_color);
     }
 }
 
@@ -1946,6 +2032,7 @@ static void lvgl_create_scope_ui(void)
     lv_obj_t *duty_group = NULL;
     const int32_t slot_width = (int32_t)(ST7796_H_RES / 4);
 
+    lv_obj_clean(screen);
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
@@ -2181,7 +2268,7 @@ static void lvgl_create_scope_ui(void)
     lv_obj_clear_flag(s_scope_chart, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(s_scope_chart, lv_color_hex(0x050505), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_scope_chart, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(s_scope_chart, lv_color_hex(0x334155), LV_PART_MAIN);
+    lv_obj_set_style_border_color(s_scope_chart, lv_color_hex(0xF8FAFC), LV_PART_MAIN);
     lv_obj_set_style_border_width(s_scope_chart, 2, LV_PART_MAIN);
     lv_obj_set_style_pad_left(s_scope_chart, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_right(s_scope_chart, 0, LV_PART_MAIN);
@@ -2213,9 +2300,9 @@ static void lvgl_create_scope_ui(void)
     lv_obj_set_style_bg_opa(s_center_horizontal_line, LV_OPA_50, LV_PART_MAIN);
     lvgl_make_chart_overlay_passthrough(s_center_horizontal_line);
 
-    s_scope_series = lv_chart_add_series(s_scope_chart, lv_color_hex(0x39FF14), LV_CHART_AXIS_PRIMARY_Y);
+    s_scope_series = lv_chart_add_series(s_scope_chart, lv_color_hex(LVGL_COLOR_TRACE_CH1), LV_CHART_AXIS_PRIMARY_Y);
     lv_chart_set_series_ext_y_array(s_scope_chart, s_scope_series, s_chart_points);
-    s_scope_series_ch2 = lv_chart_add_series(s_scope_chart, lv_color_hex(0x38BDF8), LV_CHART_AXIS_PRIMARY_Y);
+    s_scope_series_ch2 = lv_chart_add_series(s_scope_chart, lv_color_hex(LVGL_COLOR_TRACE_CH2), LV_CHART_AXIS_PRIMARY_Y);
     lv_chart_set_series_ext_y_array(s_scope_chart, s_scope_series_ch2, s_chart_points_ch2);
     lv_obj_add_event_cb(s_scope_chart, lvgl_scope_chart_event_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_scope_chart, lvgl_scope_chart_event_cb, LV_EVENT_PRESSING, NULL);
@@ -2362,12 +2449,12 @@ static void lvgl_create_scope_ui(void)
     lv_obj_set_pos(rms_group, 0, 0);
     s_rms_label = lv_label_create(rms_group);
     lv_label_set_text(s_rms_label, "RMS: --");
-    lv_obj_set_style_text_color(s_rms_label, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
-    lv_obj_align(s_rms_label, LV_ALIGN_TOP_LEFT, 8, 3);
+    lvgl_style_metric_label(s_rms_label, lv_color_hex(LVGL_COLOR_TRACE_CH1));
+    lv_obj_align(s_rms_label, LV_ALIGN_TOP_LEFT, 0, 1);
     s_rms_label_ch2 = lv_label_create(rms_group);
     lv_label_set_text(s_rms_label_ch2, "RMS: --");
-    lv_obj_set_style_text_color(s_rms_label_ch2, lv_color_hex(0x94A3B8), LV_PART_MAIN);
-    lv_obj_align(s_rms_label_ch2, LV_ALIGN_BOTTOM_LEFT, 8, -3);
+    lvgl_style_metric_label(s_rms_label_ch2, lv_color_hex(LVGL_COLOR_TRACE_CH2));
+    lv_obj_align(s_rms_label_ch2, LV_ALIGN_BOTTOM_LEFT, 0, -1);
 
     pk_group = lv_obj_create(s_metrics_strip);
     lv_obj_remove_style_all(pk_group);
@@ -2375,12 +2462,12 @@ static void lvgl_create_scope_ui(void)
     lv_obj_set_pos(pk_group, slot_width, 0);
     s_pk_label = lv_label_create(pk_group);
     lv_label_set_text(s_pk_label, "Pk+: --");
-    lv_obj_set_style_text_color(s_pk_label, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
-    lv_obj_align(s_pk_label, LV_ALIGN_TOP_LEFT, 8, 3);
+    lvgl_style_metric_label(s_pk_label, lv_color_hex(LVGL_COLOR_TRACE_CH1));
+    lv_obj_align(s_pk_label, LV_ALIGN_TOP_LEFT, 0, 1);
     s_pk_label_ch2 = lv_label_create(pk_group);
     lv_label_set_text(s_pk_label_ch2, "Pk+: --");
-    lv_obj_set_style_text_color(s_pk_label_ch2, lv_color_hex(0x94A3B8), LV_PART_MAIN);
-    lv_obj_align(s_pk_label_ch2, LV_ALIGN_BOTTOM_LEFT, 8, -3);
+    lvgl_style_metric_label(s_pk_label_ch2, lv_color_hex(LVGL_COLOR_TRACE_CH2));
+    lv_obj_align(s_pk_label_ch2, LV_ALIGN_BOTTOM_LEFT, 0, -1);
 
     pk_neg_group = lv_obj_create(s_metrics_strip);
     lv_obj_remove_style_all(pk_neg_group);
@@ -2388,12 +2475,12 @@ static void lvgl_create_scope_ui(void)
     lv_obj_set_pos(pk_neg_group, slot_width * 2, 0);
     s_pk_neg_label = lv_label_create(pk_neg_group);
     lv_label_set_text(s_pk_neg_label, "Pk-: --");
-    lv_obj_set_style_text_color(s_pk_neg_label, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
-    lv_obj_align(s_pk_neg_label, LV_ALIGN_TOP_LEFT, 8, 3);
+    lvgl_style_metric_label(s_pk_neg_label, lv_color_hex(LVGL_COLOR_TRACE_CH1));
+    lv_obj_align(s_pk_neg_label, LV_ALIGN_TOP_LEFT, 0, 1);
     s_pk_neg_label_ch2 = lv_label_create(pk_neg_group);
     lv_label_set_text(s_pk_neg_label_ch2, "Pk-: --");
-    lv_obj_set_style_text_color(s_pk_neg_label_ch2, lv_color_hex(0x94A3B8), LV_PART_MAIN);
-    lv_obj_align(s_pk_neg_label_ch2, LV_ALIGN_BOTTOM_LEFT, 8, -3);
+    lvgl_style_metric_label(s_pk_neg_label_ch2, lv_color_hex(LVGL_COLOR_TRACE_CH2));
+    lv_obj_align(s_pk_neg_label_ch2, LV_ALIGN_BOTTOM_LEFT, 0, -1);
 
     freq_group = lv_obj_create(s_metrics_strip);
     lv_obj_remove_style_all(freq_group);
@@ -2401,12 +2488,12 @@ static void lvgl_create_scope_ui(void)
     lv_obj_set_pos(freq_group, slot_width * 3, 0);
     s_freq_label = lv_label_create(freq_group);
     lv_label_set_text(s_freq_label, "Freq: --");
-    lv_obj_set_style_text_color(s_freq_label, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
-    lv_obj_align(s_freq_label, LV_ALIGN_TOP_LEFT, 8, 3);
+    lvgl_style_metric_label(s_freq_label, lv_color_hex(LVGL_COLOR_TRACE_CH1));
+    lv_obj_align(s_freq_label, LV_ALIGN_TOP_LEFT, 0, 1);
     s_freq_label_ch2 = lv_label_create(freq_group);
     lv_label_set_text(s_freq_label_ch2, "Freq: --");
-    lv_obj_set_style_text_color(s_freq_label_ch2, lv_color_hex(0x94A3B8), LV_PART_MAIN);
-    lv_obj_align(s_freq_label_ch2, LV_ALIGN_BOTTOM_LEFT, 8, -3);
+    lvgl_style_metric_label(s_freq_label_ch2, lv_color_hex(LVGL_COLOR_TRACE_CH2));
+    lv_obj_align(s_freq_label_ch2, LV_ALIGN_BOTTOM_LEFT, 0, -1);
 
     duty_group = lv_obj_create(s_metrics_strip);
     lv_obj_remove_style_all(duty_group);
@@ -2414,12 +2501,12 @@ static void lvgl_create_scope_ui(void)
     lv_obj_set_pos(duty_group, slot_width * 4, 0);
     s_duty_label = lv_label_create(duty_group);
     lv_label_set_text(s_duty_label, "Duty: --");
-    lv_obj_set_style_text_color(s_duty_label, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
-    lv_obj_align(s_duty_label, LV_ALIGN_TOP_LEFT, 8, 3);
+    lvgl_style_metric_label(s_duty_label, lv_color_hex(LVGL_COLOR_TRACE_CH1));
+    lv_obj_align(s_duty_label, LV_ALIGN_TOP_LEFT, 0, 1);
     s_duty_label_ch2 = lv_label_create(duty_group);
     lv_label_set_text(s_duty_label_ch2, "Duty: --");
-    lv_obj_set_style_text_color(s_duty_label_ch2, lv_color_hex(0x94A3B8), LV_PART_MAIN);
-    lv_obj_align(s_duty_label_ch2, LV_ALIGN_BOTTOM_LEFT, 8, -3);
+    lvgl_style_metric_label(s_duty_label_ch2, lv_color_hex(LVGL_COLOR_TRACE_CH2));
+    lv_obj_align(s_duty_label_ch2, LV_ALIGN_BOTTOM_LEFT, 0, -1);
 
     lvgl_update_scope_layout();
     lvgl_update_center_grid_lines();
