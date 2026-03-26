@@ -1,0 +1,56 @@
+# Build artifacts
+/build/
+/dist/
+/out/
+
+# CMake and Ninja generated files
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/compile_commands.json
+/build.ninja
+/.ninja_deps
+/.ninja_log
+
+# ESP-IDF generated configuration and temporary files
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.defaults
+/sdkconfig.ci
+/managed_components/
+/flasher_args.json
+/flash_args
+/flash_app_args
+/flash_bootloader_args
+/flash_project_args
+/partition_table/
+
+# Binary and firmware outputs
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+
+# Logs
+*.log
+/log/
+
+# IDE/editor
+/.vscode/
+/.idea/
+*.code-workspace
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
