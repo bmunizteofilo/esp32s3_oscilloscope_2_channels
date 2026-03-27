@@ -8,6 +8,7 @@
 #include "adc_scope.h"
 #include "ft6336u.h"
 #include "lvgl_app.h"
+#include "scope_web.h"
 #include "st7796.h"
 #include "st7796_port.h"
 
@@ -152,5 +153,6 @@ void app_main(void)
     app_init_lcd(&lcd);
     app_init_touch(&touch);
     app_init_adc_scope();
+    ESP_ERROR_CHECK(scope_web_start());
     lvgl_app_start(lcd, touch);
 }

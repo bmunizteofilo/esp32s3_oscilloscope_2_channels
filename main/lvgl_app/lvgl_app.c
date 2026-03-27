@@ -11,8 +11,10 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include "scope_web.h"
 #include "st7796_port.h"
 
 /** @brief Tag de log do módulo LVGL. */
@@ -31,7 +33,7 @@ static const char *TAG = "lvgl_app";
 #define LVGL_SPLASH_DURATION_MS (5000U)
 
 /** @brief Quantidade de divisões horizontais usada para a base de tempo. */
-#define LVGL_SCOPE_TIME_DIVS    (10U)
+#define LVGL_SCOPE_TIME_DIVS    (8U)
 
 /** @brief Quantidade de linhas verticais internas desenhadas na grade do chart. */
 #define LVGL_SCOPE_TIME_GRID_LINES (9U)
@@ -220,6 +222,41 @@ static int64_t s_center_notice_hold_until_us = 0;
 /** @brief Indica que o aviso central deve ser ocultado assim que o tempo mínimo expirar. */
 static bool s_center_notice_pending_hide = false;
 
+/** @brief Indica se o aviso central atual foi colocado pelo modo somente web. */
+static bool s_web_only_notice_active = false;
+
+/** @brief Mutex que protege o estado compartilhado entre LVGL e web. */
+static SemaphoreHandle_t s_control_state_mutex = NULL;
+
+/** @brief Último estado compartilhado publicado pela UI local. */
+static lvgl_app_control_state_t s_shared_control_state = {
+    .sample_channel_mode = 0U,
+    .timebase_index = 1U,
+    .voltscale_index = 5U,
+    .trigger_channel_index = 0U,
+    .trigger_mode = 0U,
+    .trigger_run_mode = 0U,
+    .paused = false,
+};
+
+/** @brief Estado pendente solicitado por uma interface externa. */
+static lvgl_app_control_state_t s_pending_control_state = {0};
+
+/** @brief Indica se existe um estado externo pendente para aplicação na UI local. */
+static bool s_has_pending_control_state = false;
+
+/** @brief Indica se o Auto Set foi solicitado por uma interface externa. */
+static bool s_pending_auto_set = false;
+
+/** @brief Indica se a alternância do modo foco foi solicitada por uma interface externa. */
+static bool s_pending_toggle_focus = false;
+
+/** @brief Evita recursão de callbacks ao atualizar dropdowns programaticamente. */
+static bool s_suppress_dropdown_events = false;
+
+/** @brief Indica se a tela principal do osciloscópio já foi criada. */
+static bool s_scope_ui_ready = false;
+
 /** @brief Linha horizontal que representa o nível do trigger. */
 static lv_obj_t *s_trigger_level_line = NULL;
 
@@ -334,6 +371,18 @@ static bool s_scope_paused = false;
 /** @brief Offset temporal aplicado à janela durante a pausa. */
 static size_t s_history_offset_samples = 0U;
 
+/** @brief Indica se o efeito visual de varredura contínua está ativo no modo livre. */
+static bool s_free_run_sweep_active = false;
+
+/** @brief Quantidade de pontos já revelados durante o enchimento inicial da varredura livre. */
+static size_t s_free_run_visible_points = 0U;
+
+/** @brief Última largura temporal usada pela varredura livre para detectar mudanças de configuração. */
+static size_t s_free_run_last_requested_samples = 0U;
+
+/** @brief Último modo de canal exibido usado pela varredura livre para detectar mudanças de configuração. */
+static uint16_t s_free_run_last_channel_mode = 0U;
+
 /** @brief Última posição X registrada ao iniciar um arraste horizontal. */
 static int16_t s_drag_start_x = 0;
 
@@ -418,6 +467,26 @@ static void lvgl_update_trigger_level_visuals(void);
  * @brief Atualiza as cores da faixa inferior conforme o canal exibido.
  */
 static void lvgl_update_metric_strip_styles(void);
+
+/**
+ * @brief Reorganiza o layout do osciloscópio após mudanças de modo ou canal.
+ */
+static void lvgl_update_scope_layout(void);
+
+/**
+ * @brief Atualiza as linhas e labels dos cursores conforme o estado atual.
+ */
+static void lvgl_update_cursor_visuals(void);
+
+/**
+ * @brief Atualiza o label sobre o chart com buffer ou medições de cursor.
+ */
+static void lvgl_update_buffer_label(void);
+
+/**
+ * @brief Executa a heurística de Auto Set no contexto da UI local.
+ */
+static void lvgl_apply_auto_settings(void);
 
 /**
  * @brief Callback periódica que incrementa o tick interno do LVGL.
@@ -601,6 +670,170 @@ static void lvgl_hold_center_notice(uint32_t hold_ms)
         s_center_notice_hold_until_us = hold_until_us;
     }
     s_center_notice_pending_hide = true;
+}
+
+/**
+ * @brief Reinicia o efeito visual de varredura contínua do modo livre.
+ */
+static void lvgl_reset_free_run_sweep(void);
+
+/**
+ * @brief Copia a janela recém-renderizada integralmente para o chart.
+ */
+static void lvgl_publish_pending_points_full(void);
+
+/**
+ * @brief Aplica um efeito visual de varredura contínua no modo livre.
+ *
+ * @param[in] requested_samples Janela temporal atual em amostras reais.
+ */
+static void lvgl_publish_pending_points_free_run(size_t requested_samples);
+
+/**
+ * @brief Publica o estado atual da UI local para leitura pela interface web.
+ */
+static void lvgl_publish_control_state(void)
+{
+    if (s_control_state_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_control_state_mutex, portMAX_DELAY) == pdTRUE) {
+        s_shared_control_state.sample_channel_mode = s_sample_channel_mode;
+        s_shared_control_state.timebase_index = s_timebase_index;
+        s_shared_control_state.voltscale_index = s_voltscale_index;
+        s_shared_control_state.trigger_channel_index = s_trigger_channel_index;
+        s_shared_control_state.trigger_mode = (uint16_t)s_trigger_mode;
+        s_shared_control_state.trigger_run_mode = (uint16_t)s_trigger_run_mode;
+        s_shared_control_state.paused = s_scope_paused;
+        xSemaphoreGive(s_control_state_mutex);
+    }
+}
+
+/**
+ * @brief Aplica um estado externo pendente no contexto da task do LVGL.
+ *
+ * @param[in] state Estado desejado vindo da web.
+ */
+static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    s_suppress_dropdown_events = true;
+
+    s_sample_channel_mode = (state->sample_channel_mode <= 2U) ? state->sample_channel_mode : 0U;
+    s_timebase_index = (state->timebase_index < (uint16_t)(sizeof(s_timebase_options) / sizeof(s_timebase_options[0]))) ? state->timebase_index : 0U;
+    s_voltscale_index = (state->voltscale_index < (uint16_t)(sizeof(s_voltscale_options) / sizeof(s_voltscale_options[0]))) ?
+        state->voltscale_index : ((uint16_t)(sizeof(s_voltscale_options) / sizeof(s_voltscale_options[0])) - 1U);
+    s_trigger_channel_index = (state->trigger_channel_index <= 1U) ? state->trigger_channel_index : 0U;
+    s_trigger_mode = (state->trigger_mode <= (uint16_t)ADC_SCOPE_TRIGGER_FALL) ?
+        (adc_scope_trigger_mode_t)state->trigger_mode : ADC_SCOPE_TRIGGER_FREE;
+    s_trigger_run_mode = (state->trigger_run_mode <= (uint16_t)ADC_SCOPE_TRIGGER_RUN_SINGLE) ?
+        (adc_scope_trigger_run_mode_t)state->trigger_run_mode : ADC_SCOPE_TRIGGER_RUN_AUTO;
+
+    if (!lvgl_timebase_allows_trigger()) {
+        s_trigger_mode = ADC_SCOPE_TRIGGER_FREE;
+    }
+
+    if (s_channel_dropdown != NULL) {
+        lv_dropdown_set_selected(s_channel_dropdown, s_sample_channel_mode);
+    }
+    if (s_timebase_dropdown != NULL) {
+        lv_dropdown_set_selected(s_timebase_dropdown, s_timebase_index);
+    }
+    if (s_volts_dropdown != NULL) {
+        lv_dropdown_set_selected(s_volts_dropdown, s_voltscale_index);
+    }
+    if (s_trigger_channel_dropdown != NULL) {
+        lv_dropdown_set_selected(s_trigger_channel_dropdown, s_trigger_channel_index);
+    }
+    if (s_trigger_dropdown != NULL) {
+        lv_dropdown_set_selected(s_trigger_dropdown, (uint16_t)s_trigger_mode);
+    }
+    if (s_trigger_run_dropdown != NULL) {
+        lv_dropdown_set_selected(s_trigger_run_dropdown, (uint16_t)s_trigger_run_mode);
+    }
+
+    if (state->paused != s_scope_paused) {
+        if (state->paused) {
+            if (adc_scope_stop() == ESP_OK) {
+                s_scope_paused = true;
+                s_history_offset_samples = 0U;
+            }
+        } else {
+            if (adc_scope_start() == ESP_OK) {
+                s_scope_paused = false;
+                s_history_offset_samples = 0U;
+            }
+        }
+    }
+    if (s_status_dropdown != NULL) {
+        lv_dropdown_set_selected(s_status_dropdown, s_scope_paused ? 1U : 0U);
+    }
+
+    if (s_trigger_level_mv > lvgl_get_chart_y_max_mv()) {
+        s_trigger_level_mv = lvgl_get_chart_y_max_mv();
+    }
+    if (s_cursor_voltage_mv_1 > lvgl_get_chart_y_max_mv()) {
+        s_cursor_voltage_mv_1 = lvgl_get_chart_y_max_mv();
+    }
+    if (s_cursor_voltage_mv_2 > lvgl_get_chart_y_max_mv()) {
+        s_cursor_voltage_mv_2 = lvgl_get_chart_y_max_mv();
+    }
+
+    lvgl_update_scope_layout();
+    lvgl_update_grid_scale_labels();
+    lvgl_update_trigger_level_visuals();
+    lvgl_update_cursor_visuals();
+    lvgl_update_buffer_label();
+    lvgl_publish_control_state();
+    s_suppress_dropdown_events = false;
+    lvgl_scope_refresh_timer_cb(NULL);
+}
+
+/**
+ * @brief Processa solicitações externas pendentes dentro da task do LVGL.
+ */
+static void lvgl_process_pending_external_requests(void)
+{
+    lvgl_app_control_state_t pending_state = {0};
+    bool has_pending_state = false;
+    bool pending_auto_set = false;
+    bool pending_toggle_focus = false;
+
+    if (!s_scope_ui_ready || s_control_state_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_control_state_mutex, 0) != pdTRUE) {
+        return;
+    }
+
+    has_pending_state = s_has_pending_control_state;
+    if (has_pending_state) {
+        pending_state = s_pending_control_state;
+        s_has_pending_control_state = false;
+    }
+    pending_auto_set = s_pending_auto_set;
+    s_pending_auto_set = false;
+    pending_toggle_focus = s_pending_toggle_focus;
+    s_pending_toggle_focus = false;
+    xSemaphoreGive(s_control_state_mutex);
+
+    if (has_pending_state) {
+        lvgl_apply_external_control_state(&pending_state);
+    }
+    if (pending_auto_set) {
+        lvgl_apply_auto_settings();
+        lvgl_publish_control_state();
+    }
+    if (pending_toggle_focus) {
+        s_scope_fullscreen = !s_scope_fullscreen;
+        lvgl_update_scope_layout();
+        lvgl_scope_refresh_timer_cb(NULL);
+    }
 }
 
 /**
@@ -1494,12 +1727,28 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
     const adc_scope_trigger_mode_t active_trigger_mode =
         (s_scope_paused || !lvgl_timebase_allows_trigger()) ? ADC_SCOPE_TRIGGER_FREE : s_trigger_mode;
     const adc_scope_trigger_run_mode_t active_trigger_run_mode = s_scope_paused ? ADC_SCOPE_TRIGGER_RUN_AUTO : s_trigger_run_mode;
+    const bool use_free_run_sweep =
+        (!s_scope_paused &&
+         active_trigger_mode == ADC_SCOPE_TRIGGER_FREE &&
+         s_history_offset_samples == 0U);
     int32_t *dest_buffers[ADC_SCOPE_MAX_CHANNELS] = {
         s_chart_points_pending,
         s_chart_points_pending_ch2,
     };
     adc_scope_snapshot_t next_snapshot = {0};
     (void)timer;
+
+    if (scope_web_get_output_mode() == SCOPE_OUTPUT_MODE_WEB_ONLY) {
+        lvgl_set_center_notice("So web ativo\nDisplay pausado");
+        s_center_notice_pending_hide = false;
+        s_web_only_notice_active = true;
+        return;
+    }
+
+    if (s_web_only_notice_active) {
+        lvgl_set_center_notice(NULL);
+        s_web_only_notice_active = false;
+    }
 
     if (adc_scope_copy_chart_points_multi(dest_buffers,
                                           APP_ADC_CHART_POINTS,
@@ -1518,6 +1767,7 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
     if (active_trigger_mode != ADC_SCOPE_TRIGGER_FREE &&
         active_trigger_run_mode != ADC_SCOPE_TRIGGER_RUN_AUTO &&
         !next_snapshot.trigger_found) {
+        lvgl_reset_free_run_sweep();
         s_scope_snapshot = next_snapshot;
         lvgl_update_grid_scale_labels();
         lvgl_update_buffer_label();
@@ -1526,10 +1776,13 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    for (size_t i = 0; i < APP_ADC_CHART_POINTS; i++) {
-        s_chart_points[i] = lvgl_channel_is_visible(0U) ? s_chart_points_pending[i] : INT32_MAX;
-        s_chart_points_ch2[i] = lvgl_channel_is_visible(1U) ? s_chart_points_pending_ch2[i] : INT32_MAX;
+    if (use_free_run_sweep) {
+        lvgl_publish_pending_points_free_run(requested_samples);
+    } else {
+        lvgl_reset_free_run_sweep();
+        lvgl_publish_pending_points_full();
     }
+
     s_scope_snapshot = next_snapshot;
 
     lv_chart_set_axis_range(s_scope_chart, LV_CHART_AXIS_PRIMARY_Y, 0, lvgl_get_chart_y_max_mv());
@@ -1567,6 +1820,9 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
  */
 static void lvgl_channel_dropdown_event_cb(lv_event_t *e)
 {
+    if (s_suppress_dropdown_events) {
+        return;
+    }
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
         return;
     }
@@ -1577,7 +1833,89 @@ static void lvgl_channel_dropdown_event_cb(lv_event_t *e)
     }
 
     lvgl_update_scope_layout();
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
+}
+
+/**
+ * @brief Reinicia o efeito visual de varredura contínua do modo livre.
+ */
+static void lvgl_reset_free_run_sweep(void)
+{
+    s_free_run_sweep_active = false;
+    s_free_run_visible_points = 0U;
+    s_free_run_last_requested_samples = 0U;
+    s_free_run_last_channel_mode = s_sample_channel_mode;
+}
+
+/**
+ * @brief Copia a janela recém-renderizada integralmente para o chart.
+ */
+static void lvgl_publish_pending_points_full(void)
+{
+    for (size_t i = 0; i < APP_ADC_CHART_POINTS; i++) {
+        s_chart_points[i] = lvgl_channel_is_visible(0U) ? s_chart_points_pending[i] : INT32_MAX;
+        s_chart_points_ch2[i] = lvgl_channel_is_visible(1U) ? s_chart_points_pending_ch2[i] : INT32_MAX;
+    }
+}
+
+/**
+ * @brief Aplica um efeito visual de varredura contínua no modo livre.
+ *
+ * @param[in] requested_samples Janela temporal atual em amostras reais.
+ */
+static void lvgl_publish_pending_points_free_run(size_t requested_samples)
+{
+    uint32_t sample_freq_hz = APP_ADC_SAMPLE_FREQ_HZ;
+    uint64_t new_samples_est = 0U;
+    size_t delta_points = 1U;
+
+    if (!s_free_run_sweep_active ||
+        s_free_run_last_requested_samples != requested_samples ||
+        s_free_run_last_channel_mode != s_sample_channel_mode) {
+        lvgl_reset_free_run_sweep();
+        s_free_run_sweep_active = true;
+        s_free_run_last_requested_samples = requested_samples;
+        s_free_run_last_channel_mode = s_sample_channel_mode;
+    }
+
+    (void)adc_scope_get_sample_freq_hz(&sample_freq_hz);
+    new_samples_est = ((uint64_t)sample_freq_hz * (uint64_t)LVGL_SCOPE_REFRESH_MS) / 1000ULL;
+    if (new_samples_est == 0U) {
+        new_samples_est = 1U;
+    }
+
+    if (requested_samples > 0U) {
+        delta_points = (size_t)(((new_samples_est * APP_ADC_CHART_POINTS) + requested_samples - 1U) / requested_samples);
+        if (delta_points == 0U) {
+            delta_points = 1U;
+        }
+        if (delta_points > APP_ADC_CHART_POINTS) {
+            delta_points = APP_ADC_CHART_POINTS;
+        }
+    }
+
+    if (s_free_run_visible_points < APP_ADC_CHART_POINTS) {
+        size_t visible_points = s_free_run_visible_points + delta_points;
+        if (visible_points > APP_ADC_CHART_POINTS) {
+            visible_points = APP_ADC_CHART_POINTS;
+        }
+
+        for (size_t i = 0; i < APP_ADC_CHART_POINTS; i++) {
+            if (i < visible_points) {
+                s_chart_points[i] = lvgl_channel_is_visible(0U) ? s_chart_points_pending[i] : INT32_MAX;
+                s_chart_points_ch2[i] = lvgl_channel_is_visible(1U) ? s_chart_points_pending_ch2[i] : INT32_MAX;
+            } else {
+                s_chart_points[i] = INT32_MAX;
+                s_chart_points_ch2[i] = INT32_MAX;
+            }
+        }
+
+        s_free_run_visible_points = visible_points;
+        return;
+    }
+
+    lvgl_publish_pending_points_full();
 }
 
 /**
@@ -1587,6 +1925,9 @@ static void lvgl_channel_dropdown_event_cb(lv_event_t *e)
  */
 static void lvgl_trigger_channel_dropdown_event_cb(lv_event_t *e)
 {
+    if (s_suppress_dropdown_events) {
+        return;
+    }
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
         return;
     }
@@ -1596,6 +1937,7 @@ static void lvgl_trigger_channel_dropdown_event_cb(lv_event_t *e)
         s_trigger_channel_index = 0U;
     }
 
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
 
@@ -1666,6 +2008,9 @@ static void lvgl_auto_dropdown_event_cb(lv_event_t *e)
  */
 static void lvgl_timebase_dropdown_event_cb(lv_event_t *e)
 {
+    if (s_suppress_dropdown_events) {
+        return;
+    }
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
         return;
     }
@@ -1683,6 +2028,7 @@ static void lvgl_timebase_dropdown_event_cb(lv_event_t *e)
         }
     }
 
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
 
@@ -1693,6 +2039,9 @@ static void lvgl_timebase_dropdown_event_cb(lv_event_t *e)
  */
 static void lvgl_volts_dropdown_event_cb(lv_event_t *e)
 {
+    if (s_suppress_dropdown_events) {
+        return;
+    }
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
         return;
     }
@@ -1712,6 +2061,7 @@ static void lvgl_volts_dropdown_event_cb(lv_event_t *e)
         s_cursor_voltage_mv_2 = lvgl_get_chart_y_max_mv();
     }
 
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
 
@@ -1724,6 +2074,9 @@ static void lvgl_trigger_dropdown_event_cb(lv_event_t *e)
 {
     uint16_t selected = 0;
 
+    if (s_suppress_dropdown_events) {
+        return;
+    }
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
         return;
     }
@@ -1740,6 +2093,7 @@ static void lvgl_trigger_dropdown_event_cb(lv_event_t *e)
         s_trigger_visual_hold_until_us = 0;
     }
     lvgl_update_trigger_level_visuals();
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
 
@@ -1752,6 +2106,9 @@ static void lvgl_trigger_run_dropdown_event_cb(lv_event_t *e)
 {
     uint16_t selected = 0;
 
+    if (s_suppress_dropdown_events) {
+        return;
+    }
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
         return;
     }
@@ -1762,6 +2119,7 @@ static void lvgl_trigger_run_dropdown_event_cb(lv_event_t *e)
     }
 
     s_trigger_run_mode = (adc_scope_trigger_run_mode_t)selected;
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
 
@@ -1774,6 +2132,9 @@ static void lvgl_status_dropdown_event_cb(lv_event_t *e)
 {
     const uint16_t selected = (uint16_t)lv_dropdown_get_selected(lv_event_get_target_obj(e));
 
+    if (s_suppress_dropdown_events) {
+        return;
+    }
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
         return;
     }
@@ -1794,6 +2155,7 @@ static void lvgl_status_dropdown_event_cb(lv_event_t *e)
         }
     }
 
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
 
@@ -2511,6 +2873,8 @@ static void lvgl_create_scope_ui(void)
     lvgl_update_scope_layout();
     lvgl_update_center_grid_lines();
     lv_timer_create(lvgl_scope_refresh_timer_cb, LVGL_SCOPE_REFRESH_MS, NULL);
+    s_scope_ui_ready = true;
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
 
@@ -2608,6 +2972,7 @@ static void lvgl_task(void *arg)
 
     lvgl_create_splash_ui();
     while (elapsed_ms < LVGL_SPLASH_DURATION_MS) {
+        lvgl_process_pending_external_requests();
         uint32_t delay_ms = lv_timer_handler();
         if (delay_ms > LVGL_TASK_PERIOD_MS) {
             delay_ms = LVGL_TASK_PERIOD_MS;
@@ -2623,6 +2988,7 @@ static void lvgl_task(void *arg)
     ESP_LOGI(TAG, "LVGL 9 integrado ao ST7796 com visual de osciloscopio.");
 
     while (true) {
+        lvgl_process_pending_external_requests();
         uint32_t delay_ms = lv_timer_handler();
         if (delay_ms > LVGL_TASK_PERIOD_MS) {
             delay_ms = LVGL_TASK_PERIOD_MS;
@@ -2640,6 +3006,65 @@ void lvgl_app_start(st7796_handle_t lcd, ft6336u_handle_t touch)
     s_touch = touch;
 
     ESP_ERROR_CHECK(s_lcd ? ESP_OK : ESP_ERR_INVALID_ARG);
+    s_control_state_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_control_state_mutex ? ESP_OK : ESP_ERR_NO_MEM);
     lvgl_init_runtime();
-    xTaskCreate(lvgl_task, "lvgl", ST7796_LVGL_TASK_STACK_SIZE, NULL, ST7796_LVGL_TASK_PRIORITY, NULL);
+    xTaskCreatePinnedToCore(lvgl_task,
+                            "lvgl",
+                            ST7796_LVGL_TASK_STACK_SIZE,
+                            NULL,
+                            ST7796_LVGL_TASK_PRIORITY,
+                            NULL,
+                            ST7796_LVGL_TASK_CORE_ID);
+}
+
+esp_err_t lvgl_app_get_control_state(lvgl_app_control_state_t *out_state)
+{
+    ESP_RETURN_ON_FALSE(out_state != NULL, ESP_ERR_INVALID_ARG, TAG, "estado invalido");
+    ESP_RETURN_ON_FALSE(s_control_state_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "mutex nao inicializado");
+
+    if (xSemaphoreTake(s_control_state_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    *out_state = s_shared_control_state;
+    xSemaphoreGive(s_control_state_mutex);
+    return ESP_OK;
+}
+
+esp_err_t lvgl_app_request_control_state(const lvgl_app_control_state_t *state)
+{
+    ESP_RETURN_ON_FALSE(state != NULL, ESP_ERR_INVALID_ARG, TAG, "estado invalido");
+    ESP_RETURN_ON_FALSE(s_control_state_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "mutex nao inicializado");
+
+    if (xSemaphoreTake(s_control_state_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_pending_control_state = *state;
+    s_has_pending_control_state = true;
+    xSemaphoreGive(s_control_state_mutex);
+    return ESP_OK;
+}
+
+esp_err_t lvgl_app_request_auto_set(void)
+{
+    ESP_RETURN_ON_FALSE(s_control_state_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "mutex nao inicializado");
+
+    if (xSemaphoreTake(s_control_state_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_pending_auto_set = true;
+    xSemaphoreGive(s_control_state_mutex);
+    return ESP_OK;
+}
+
+esp_err_t lvgl_app_request_toggle_focus(void)
+{
+    ESP_RETURN_ON_FALSE(s_control_state_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "mutex nao inicializado");
+
+    if (xSemaphoreTake(s_control_state_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_pending_toggle_focus = true;
+    xSemaphoreGive(s_control_state_mutex);
+    return ESP_OK;
 }

@@ -28,6 +28,7 @@
 #define ST7796_DRAW_BUFFER_LINES    (40U)        /**< Quantidade de linhas por bloco no buffer de desenho em RAM interna. */
 #define ST7796_LVGL_TASK_STACK_SIZE (8192U)      /**< Tamanho da stack da task dedicada ao LVGL em bytes. */
 #define ST7796_LVGL_TASK_PRIORITY   (4U)         /**< Prioridade da task dedicada ao LVGL. */
+#define ST7796_LVGL_TASK_CORE_ID    (1)          /**< Core usado pela task dedicada ao LVGL. */
 #define ST7796_X_GAP                (0U)         /**< Offset horizontal aplicado ao programar a janela de escrita. */
 #define ST7796_Y_GAP                (0U)         /**< Offset vertical aplicado ao programar a janela de escrita. */
 #define ST7796_SWAP_XY              (1)          /**< Troca os eixos X e Y via registrador MADCTL para usar o painel em paisagem. */
@@ -62,3 +63,10 @@
 #define APP_ADC_STORE_BUFFER_BYTES  (2048U)      /**< Tamanho do pool interno do driver contínuo do ADC em bytes. */
 #define APP_ADC_TASK_STACK_SIZE     (4096U)      /**< Tamanho da stack da task de aquisição ADC em bytes. */
 #define APP_ADC_TASK_PRIORITY       (5U)         /**< Prioridade da task dedicada à captura ADC. */
+
+#define APP_WEB_ENABLED             (1)                 /**< Habilita a interface web via SoftAP quando diferente de zero. */
+#define APP_WEB_SOFTAP_SSID         "MiniOsciloscopio" /**< SSID publicado pelo modo SoftAP do ESP32-S3. */
+#define APP_WEB_SOFTAP_PASSWORD     "12345678"         /**< Senha WPA2 do SoftAP. Use string vazia para rede aberta. */
+#define APP_WEB_SOFTAP_CHANNEL      (6)                /**< Canal Wi-Fi usado pelo SoftAP. */
+#define APP_WEB_SOFTAP_MAX_CONN     (4)                /**< Quantidade máxima de clientes conectados ao SoftAP. */
+#define APP_WEB_HTTPD_CORE_ID       (0)                /**< Core preferencial do servidor HTTP da interface web. */
