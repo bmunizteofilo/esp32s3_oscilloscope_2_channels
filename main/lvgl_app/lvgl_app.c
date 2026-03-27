@@ -434,7 +434,7 @@ static void lvgl_make_chart_overlay_passthrough(lv_obj_t *obj)
  */
 static bool lvgl_timebase_allows_trigger(void)
 {
-    return s_timebase_options[s_timebase_index].total_window_us < 1000000U;
+    return s_timebase_options[s_timebase_index].total_window_us < 500000U;
 }
 
 /**
@@ -2084,6 +2084,19 @@ static void lvgl_trigger_dropdown_event_cb(lv_event_t *e)
     selected = (uint16_t)lv_dropdown_get_selected(lv_event_get_target_obj(e));
     if (selected > (uint16_t)ADC_SCOPE_TRIGGER_FALL) {
         selected = (uint16_t)ADC_SCOPE_TRIGGER_FREE;
+    }
+
+    if (selected != (uint16_t)ADC_SCOPE_TRIGGER_FREE && !lvgl_timebase_allows_trigger()) {
+        s_trigger_mode = ADC_SCOPE_TRIGGER_FREE;
+        s_trigger_visual_hold_until_us = 0;
+        if (s_trigger_dropdown != NULL) {
+            lv_dropdown_set_selected(s_trigger_dropdown, (uint16_t)ADC_SCOPE_TRIGGER_FREE);
+        }
+        lvgl_update_trigger_level_visuals();
+        lvgl_set_center_notice("Trigger desabilitado\npara esta base de tempo");
+        lvgl_hold_center_notice(1800U);
+        lvgl_scope_refresh_timer_cb(NULL);
+        return;
     }
 
     s_trigger_mode = (adc_scope_trigger_mode_t)selected;

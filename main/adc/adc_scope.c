@@ -194,8 +194,22 @@ static void adc_scope_render_window_locked(size_t channel_index,
     }
 
     for (size_t i = 0; i < point_count; i++) {
-        const size_t src_offset = (i * (window_len - 1U)) / (point_count - 1U);
-        const int32_t mv = adc_scope_get_source_sample_locked(channel_index, circular_source, oldest_start, window_start + src_offset);
+        const uint64_t scaled_pos = ((uint64_t)i * (uint64_t)(window_len - 1U) * 1024ULL) / (uint64_t)(point_count - 1U);
+        const size_t src_index = (size_t)(scaled_pos / 1024ULL);
+        const uint32_t frac = (uint32_t)(scaled_pos % 1024ULL);
+        const int32_t sample_a =
+            adc_scope_get_source_sample_locked(channel_index, circular_source, oldest_start, window_start + src_index);
+        int32_t mv = sample_a;
+
+        if ((src_index + 1U) < window_len && frac > 0U) {
+            const int32_t sample_b =
+                adc_scope_get_source_sample_locked(channel_index, circular_source, oldest_start, window_start + src_index + 1U);
+            const int64_t interp =
+                ((int64_t)sample_a * (int64_t)(1024U - frac)) +
+                ((int64_t)sample_b * (int64_t)frac);
+            mv = (int32_t)(interp / 1024LL);
+        }
+
         dest[i] = mv;
         if (mv < min_mv) {
             min_mv = mv;
@@ -236,12 +250,13 @@ static void adc_scope_measure_window_locked(size_t channel_index,
                                             uint32_t *out_duty_tenths_percent,
                                             bool *out_valid)
 {
-    size_t crossing_index[16] = {0};
-    bool crossing_rising[16] = {0};
+    size_t crossing_index[24] = {0};
+    bool crossing_rising[24] = {0};
     size_t crossing_count = 0U;
-    size_t period_start = 0U;
-    size_t period_end = 0U;
-    bool valid = false;
+    size_t first_edge = 0U;
+    size_t last_edge = 0U;
+    size_t matching_edges = 0U;
+    bool matching_polarity = false;
 
     if (out_freq_tenths_hz != NULL) {
         *out_freq_tenths_hz = 0U;
@@ -272,35 +287,49 @@ static void adc_scope_measure_window_locked(size_t channel_index,
         crossing_count++;
     }
 
-    for (size_t i = 0; (i + 2U) < crossing_count; i++) {
-        if (crossing_rising[i] == crossing_rising[i + 2U]) {
-            period_start = crossing_index[i];
-            period_end = crossing_index[i + 2U];
-            valid = (period_end > period_start);
-            break;
+    for (size_t i = 0; i < crossing_count; i++) {
+        if (matching_edges == 0U) {
+            matching_polarity = crossing_rising[i];
+            first_edge = crossing_index[i];
+            last_edge = crossing_index[i];
+            matching_edges = 1U;
+            continue;
+        }
+
+        if (crossing_rising[i] == matching_polarity) {
+            last_edge = crossing_index[i];
+            matching_edges++;
         }
     }
 
-    if (!valid) {
+    if (matching_edges < 2U || last_edge <= first_edge) {
         return;
     }
 
     if (out_freq_tenths_hz != NULL) {
         const uint64_t numerator = (uint64_t)s_scope.config.sample_freq_hz * 10ULL;
-        *out_freq_tenths_hz = (uint32_t)((numerator + ((period_end - period_start) / 2U)) / (uint64_t)(period_end - period_start));
+        const uint64_t avg_period_samples =
+            ((uint64_t)(last_edge - first_edge) + ((uint64_t)(matching_edges - 1U) / 2ULL)) /
+            (uint64_t)(matching_edges - 1U);
+
+        if (avg_period_samples == 0U) {
+            return;
+        }
+
+        *out_freq_tenths_hz = (uint32_t)((numerator + (avg_period_samples / 2ULL)) / avg_period_samples);
     }
 
     if (out_duty_tenths_percent != NULL) {
         uint32_t high_samples = 0U;
 
-        for (size_t i = period_start; i < period_end; i++) {
+        for (size_t i = first_edge; i < last_edge; i++) {
             const int32_t mv = adc_scope_get_source_sample_locked(channel_index, circular_source, oldest_start, window_start + i);
             if (mv >= threshold_mv) {
                 high_samples++;
             }
         }
 
-        *out_duty_tenths_percent = (uint32_t)(((uint64_t)high_samples * 1000ULL) / (uint64_t)(period_end - period_start));
+        *out_duty_tenths_percent = (uint32_t)(((uint64_t)high_samples * 1000ULL) / (uint64_t)(last_edge - first_edge));
     }
 
     if (out_valid != NULL) {

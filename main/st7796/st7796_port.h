@@ -57,7 +57,7 @@
 #define APP_ADC_ATTENUATION_1      ADC_ATTEN_DB_12 /**< Atenuação do canal 1 usada na conversão. */
 #define APP_ADC_ATTENUATION_2      ADC_ATTEN_DB_12 /**< Atenuação do canal 2 usada na conversão. */
 #define APP_ADC_HISTORY_SAMPLES     (20000U)      /**< Quantidade de amostras retidas no histórico circular para a base de tempo. */
-#define APP_ADC_CHART_POINTS        (240U)       /**< Quantidade de pontos exibidos no gráfico do osciloscópio. */
+#define APP_ADC_CHART_POINTS        (470U)       /**< Quantidade de pontos exibidos no gráfico do osciloscópio. */
 #define APP_ADC_BLOCK_SAMPLES       (240U)       /**< Quantidade padrão de amostras em uma captura por bloco. */
 #define APP_ADC_DMA_FRAME_BYTES     (256U)       /**< Tamanho do frame DMA do ADC em bytes. */
 #define APP_ADC_STORE_BUFFER_BYTES  (2048U)      /**< Tamanho do pool interno do driver contínuo do ADC em bytes. */
