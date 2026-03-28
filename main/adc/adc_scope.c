@@ -1580,6 +1580,70 @@ esp_err_t adc_scope_get_sample_freq_hz(uint32_t *out_sample_freq_hz)
 }
 
 /**
+ * @brief Reconfigura a frequência de amostragem por canal do ADC contínuo.
+ *
+ * @param[in] sample_freq_hz Nova frequência desejada em hertz por canal.
+ *
+ * @return `ESP_OK` em caso de sucesso.
+ */
+esp_err_t adc_scope_set_sample_freq_hz(uint32_t sample_freq_hz)
+{
+    adc_continuous_config_t adc_config = {0};
+    adc_digi_pattern_config_t patterns[ADC_SCOPE_MAX_CHANNELS] = {0};
+    bool was_started = false;
+
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+    ESP_RETURN_ON_FALSE(sample_freq_hz > 0U, ESP_ERR_INVALID_ARG, TAG, "sample_freq_hz invalida");
+
+    if (sample_freq_hz == s_scope.config.sample_freq_hz) {
+        return ESP_OK;
+    }
+
+    was_started = s_scope.started;
+    if (was_started) {
+        ESP_RETURN_ON_ERROR(adc_scope_stop(), TAG, "falha ao interromper ADC para reconfigurar frequencia");
+    }
+
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        patterns[i].atten = (uint8_t)s_scope.config.attenuations[i];
+        patterns[i].channel = (uint8_t)s_scope.config.channels[i];
+        patterns[i].unit = (uint8_t)s_scope.config.unit;
+        patterns[i].bit_width = (uint8_t)s_scope.config.bitwidth;
+    }
+
+    adc_config.pattern_num = s_scope.config.channel_count;
+    adc_config.adc_pattern = patterns;
+    adc_config.sample_freq_hz = sample_freq_hz * (uint32_t)s_scope.config.channel_count;
+    adc_config.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+    adc_config.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+    ESP_RETURN_ON_ERROR(adc_continuous_config(s_scope.adc_handle, &adc_config), TAG, "falha ao reconfigurar ADC continuo");
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    s_scope.config.sample_freq_hz = sample_freq_hz;
+    s_scope.trigger_holdoff_samples = s_scope.config.sample_freq_hz / 2000U;
+    if (s_scope.trigger_holdoff_samples < 4U) {
+        s_scope.trigger_holdoff_samples = 4U;
+    }
+    s_scope.trigger_cache_valid = false;
+    adc_scope_reset_trigger_events_locked();
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        s_scope.prev_mv_valid[i] = false;
+    }
+
+    xSemaphoreGive(s_scope.mutex);
+
+    if (was_started) {
+        ESP_RETURN_ON_ERROR(adc_scope_start(), TAG, "falha ao reiniciar ADC apos reconfigurar frequencia");
+    }
+
+    ESP_LOGI(TAG, "ADC reconfigurado para %" PRIu32 " Hz/canal", sample_freq_hz);
+    return ESP_OK;
+}
+
+/**
  * @brief Retorna a quantidade de canais configurados.
  *
  * @param[out] out_channel_count Quantidade de canais habilitados.

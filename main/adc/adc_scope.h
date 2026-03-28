@@ -180,6 +180,15 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
 esp_err_t adc_scope_get_sample_freq_hz(uint32_t *out_sample_freq_hz);
 
 /**
+ * @brief Reconfigura a frequência de amostragem por canal do ADC contínuo.
+ *
+ * @param[in] sample_freq_hz Nova frequência desejada em hertz por canal.
+ *
+ * @return `ESP_OK` em caso de sucesso.
+ */
+esp_err_t adc_scope_set_sample_freq_hz(uint32_t sample_freq_hz);
+
+/**
  * @brief Retorna a quantidade de canais configurados.
  *
  * @param[out] out_channel_count Quantidade de canais habilitados.

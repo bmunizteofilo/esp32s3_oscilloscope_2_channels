@@ -386,6 +386,9 @@ static uint16_t s_free_run_last_channel_mode = 0U;
 /** @brief Última sequência absoluta usada como referência do modo livre. */
 static uint64_t s_free_run_last_sequence = 0U;
 
+/** @brief Acumulador fracionário do avanço horizontal do modo livre lento (Q10). */
+static uint64_t s_free_run_scroll_accum_fp = 0U;
+
 /** @brief Última posição X registrada ao iniciar um arraste horizontal. */
 static int16_t s_drag_start_x = 0;
 
@@ -614,9 +617,62 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
  *
  * @return Estrutura da base de tempo atualmente ativa.
  */
+static void lvgl_reset_free_run_sweep(void);
+
+/**
+ * @brief Retorna a base de tempo selecionada no dropdown.
+ *
+ * @return Estrutura da base de tempo atualmente ativa.
+ */
 static const lvgl_scope_timebase_t *lvgl_get_selected_timebase(void)
 {
     return &s_timebase_options[s_timebase_index];
+}
+
+/**
+ * @brief Retorna a taxa de amostragem desejada para a base de tempo atual.
+ *
+ * @return Frequência do ADC em hertz por canal.
+ */
+static uint32_t lvgl_get_target_sample_freq_hz(void)
+{
+    const uint32_t window_us = lvgl_get_selected_timebase()->total_window_us;
+
+    if (window_us >= 1000000U) {
+        return 5000U;
+    }
+    if (window_us >= 500000U) {
+        return 10000U;
+    }
+    if (window_us >= 250000U) {
+        return 15000U;
+    }
+    return 40000U;
+}
+
+/**
+ * @brief Aplica a taxa de amostragem coerente com a base de tempo atual.
+ */
+static void lvgl_apply_sample_freq_for_timebase(void)
+{
+    const uint32_t target_hz = lvgl_get_target_sample_freq_hz();
+    uint32_t current_hz = 0U;
+
+    if (adc_scope_get_sample_freq_hz(&current_hz) != ESP_OK) {
+        return;
+    }
+
+    if (current_hz == target_hz) {
+        return;
+    }
+
+    if (adc_scope_set_sample_freq_hz(target_hz) != ESP_OK) {
+        ESP_LOGW(TAG, "Falha ao aplicar taxa %" PRIu32 " Hz para base %s", target_hz, lvgl_get_selected_timebase()->label);
+        return;
+    }
+
+    s_history_offset_samples = 0U;
+    lvgl_reset_free_run_sweep();
 }
 
 /**
@@ -754,6 +810,11 @@ static void lvgl_reset_free_run_sweep(void);
 static void lvgl_publish_pending_points_full(void);
 
 /**
+ * @brief Reinicia o efeito visual de varredura contínua do modo livre.
+ */
+static void lvgl_reset_free_run_sweep(void);
+
+/**
  * @brief Aplica um efeito visual de varredura contínua no modo livre.
  *
  * @param[in] requested_samples Janela temporal atual em amostras reais.
@@ -807,6 +868,8 @@ static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *st
     if (!lvgl_timebase_allows_trigger() && lvgl_trigger_run_enabled()) {
         s_trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF;
     }
+
+    lvgl_apply_sample_freq_for_timebase();
 
     if (s_channel_dropdown != NULL) {
         lv_dropdown_set_selected(s_channel_dropdown, s_sample_channel_mode);
@@ -1085,6 +1148,8 @@ static void lvgl_apply_auto_settings(void)
             s_timebase_index = (uint16_t)(sizeof(s_timebase_options) / sizeof(s_timebase_options[0])) - 1U;
         }
     }
+
+    lvgl_apply_sample_freq_for_timebase();
 
     if (s_volts_dropdown != NULL) {
         lv_dropdown_set_selected(s_volts_dropdown, s_voltscale_index);
@@ -1939,6 +2004,7 @@ static void lvgl_reset_free_run_sweep(void)
     s_free_run_last_requested_samples = 0U;
     s_free_run_last_channel_mode = s_sample_channel_mode;
     s_free_run_last_sequence = 0U;
+    s_free_run_scroll_accum_fp = 0U;
 }
 
 /**
@@ -1961,7 +2027,7 @@ static void lvgl_publish_pending_points_free_run(size_t requested_samples)
 {
     uint32_t sample_freq_hz = APP_ADC_SAMPLE_FREQ_HZ;
     uint64_t new_samples = 0U;
-    size_t delta_points = 1U;
+    size_t delta_points = 0U;
     bool use_slow_incremental_scroll = false;
     const bool ch1_visible = lvgl_channel_is_visible(0U);
     const bool ch2_visible = lvgl_channel_is_visible(1U);
@@ -1991,19 +2057,16 @@ static void lvgl_publish_pending_points_free_run(size_t requested_samples)
     s_free_run_last_sequence = current_sequence;
 
     if (requested_samples > 0U) {
-        delta_points = (size_t)(((new_samples * APP_ADC_CHART_POINTS) + requested_samples - 1U) / requested_samples);
-        if (delta_points == 0U) {
-            delta_points = 1U;
-        }
-        if (delta_points > APP_ADC_CHART_POINTS) {
-            delta_points = APP_ADC_CHART_POINTS;
-        }
+        s_free_run_scroll_accum_fp +=
+            ((uint64_t)new_samples * (uint64_t)APP_ADC_CHART_POINTS * 1024ULL) / (uint64_t)requested_samples;
+        delta_points = (size_t)(s_free_run_scroll_accum_fp / 1024ULL);
+        s_free_run_scroll_accum_fp %= 1024ULL;
     }
 
     use_slow_incremental_scroll = (requested_samples >= (size_t)(sample_freq_hz / 4U));
 
     if (s_free_run_visible_points < APP_ADC_CHART_POINTS) {
-        size_t visible_points = s_free_run_visible_points + delta_points;
+        size_t visible_points = s_free_run_visible_points + ((delta_points > 0U) ? delta_points : 1U);
         if (visible_points > APP_ADC_CHART_POINTS) {
             visible_points = APP_ADC_CHART_POINTS;
         }
@@ -2023,6 +2086,10 @@ static void lvgl_publish_pending_points_free_run(size_t requested_samples)
     }
 
     if (use_slow_incremental_scroll) {
+        if (delta_points == 0U) {
+            return;
+        }
+
         if (delta_points >= APP_ADC_CHART_POINTS) {
             lvgl_publish_pending_points_full();
             return;
@@ -2156,6 +2223,7 @@ static void lvgl_timebase_dropdown_event_cb(lv_event_t *e)
         lvgl_hold_center_notice(1800U);
     }
 
+    lvgl_apply_sample_freq_for_timebase();
     lvgl_sync_adc_trigger_monitor();
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
@@ -2475,8 +2543,9 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
                 return;
             }
 
-            delta_mv = (int32_t)(((int64_t)(-delta_y) * (int64_t)lvgl_get_chart_y_max_mv()) / (int64_t)height_px);
-            new_trigger_level_mv = s_drag_start_trigger_level_mv + delta_mv;
+            new_trigger_level_mv =
+                lvgl_get_chart_y_max_mv() -
+                (int32_t)(((int64_t)local_y * (int64_t)lvgl_get_chart_y_max_mv()) / (int64_t)height_px);
             if (new_trigger_level_mv < 0) {
                 new_trigger_level_mv = 0;
             } else if (new_trigger_level_mv > lvgl_get_chart_y_max_mv()) {
