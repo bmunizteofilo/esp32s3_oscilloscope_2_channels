@@ -148,8 +148,8 @@ static const scope_web_view_state_t s_scope_web_default_state = {
     .timebase_index = 1U,
     .voltscale_index = 5U,
     .trigger_channel_index = 0U,
-    .trigger_mode = ADC_SCOPE_TRIGGER_FREE,
-    .trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_AUTO,
+    .trigger_mode = ADC_SCOPE_TRIGGER_RISE,
+    .trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF,
     .paused = false,
     .trigger_level_mv = 1650,
 };
@@ -160,8 +160,8 @@ static scope_web_view_state_t s_scope_web_runtime_state = {
     .timebase_index = 1U,
     .voltscale_index = 5U,
     .trigger_channel_index = 0U,
-    .trigger_mode = ADC_SCOPE_TRIGGER_FREE,
-    .trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_AUTO,
+    .trigger_mode = ADC_SCOPE_TRIGGER_RISE,
+    .trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF,
     .paused = false,
     .trigger_level_mv = 1650,
 };
@@ -261,17 +261,17 @@ static const char s_scope_web_html[] =
     "      <div class=\"card\">\n"
     "        <label for=\"triggerMode\">Trigger</label>\n"
     "        <select id=\"triggerMode\">\n"
-    "          <option value=\"0\" selected>Off</option>\n"
-    "          <option value=\"1\">Subida</option>\n"
+    "          <option value=\"1\" selected>Subida</option>\n"
     "          <option value=\"2\">Descida</option>\n"
     "        </select>\n"
     "      </div>\n"
     "      <div class=\"card\">\n"
     "        <label for=\"triggerRunMode\">Trig Run</label>\n"
     "        <select id=\"triggerRunMode\">\n"
-    "          <option value=\"0\" selected>Auto</option>\n"
-    "          <option value=\"1\">Normal</option>\n"
-    "          <option value=\"2\">Single</option>\n"
+    "          <option value=\"0\" selected>Off</option>\n"
+    "          <option value=\"1\">Auto</option>\n"
+    "          <option value=\"2\">Normal</option>\n"
+    "          <option value=\"3\">Single</option>\n"
     "        </select>\n"
     "      </div>\n"
     "      <div class=\"card\">\n"
@@ -340,7 +340,7 @@ static const char s_scope_web_html[] =
     "    const modeNote = document.getElementById('modeNote');\n"
     "    const TIMEBASES_US = [5000,10000,15000,20000,25000,50000,100000,250000,500000,1000000];\n"
     "    const VOLTSCALES_MV = [100,200,500,1000,2000,3300];\n"
-    "    const webState = { channel:0, outputMode:'both', commandMode:false, timebase:1, voltscale:5, triggerMode:0, triggerRunMode:0, triggerChannel:0, paused:false, cursorMode:0, cursorLine:0, triggerLevelMv:1650 };\n"
+    "    const webState = { channel:0, outputMode:'both', commandMode:false, timebase:1, voltscale:5, triggerMode:1, triggerRunMode:0, triggerChannel:0, paused:false, cursorMode:0, cursorLine:0, triggerLevelMv:1650 };\n"
     "    let refreshTimer = null;\n"
     "    let requestInFlight = false;\n"
     "    let pendingRefresh = false;\n"
@@ -359,7 +359,7 @@ static const char s_scope_web_html[] =
     "    function getActivePointCount() { return lastPayload && lastPayload.points_ch1 && lastPayload.points_ch1.length ? lastPayload.points_ch1.length : (webState.outputMode === 'web' ? 240 : 120); }\n"
     "    function normalizeCursorState() { const count = Math.max(getActivePointCount() - 1, 1); cursorTimePos1 = Math.max(0, Math.min(count, cursorTimePos1)); cursorTimePos2 = Math.max(0, Math.min(count, cursorTimePos2)); cursorVoltageMv1 = Math.max(0, Math.min(getYMaxMv(), cursorVoltageMv1)); cursorVoltageMv2 = Math.max(0, Math.min(getYMaxMv(), cursorVoltageMv2)); }\n"
     "    function updateGesturePolicy() {\n"
-    "      const lockCanvas = webState.cursorMode !== 0 || webState.triggerMode !== 0;\n"
+    "      const lockCanvas = webState.cursorMode !== 0 || webState.triggerRunMode !== 0;\n"
     "      canvas.style.touchAction = lockCanvas ? 'none' : 'pan-y pinch-zoom';\n"
     "      document.body.style.overscrollBehaviorY = lockCanvas ? 'none' : 'auto';\n"
     "      document.documentElement.style.overscrollBehaviorY = lockCanvas ? 'none' : 'auto';\n"
@@ -439,7 +439,7 @@ static const char s_scope_web_html[] =
     "    }\n"
     "    function fmtMv(mv) { return (mv / 1000).toFixed(3) + ' V'; }\n"
     "    function fmtUs(us) { if (us >= 1000000) return (us / 1000000).toFixed(3) + ' s'; if (us >= 1000) return (us / 1000).toFixed(3) + ' ms'; return Math.round(us) + ' us'; }\n"
-    "    function drawTriggerOverlay() { if (webState.triggerMode === 0) return; const yMax = getYMaxMv(); const y = canvas.height - ((Math.max(0, Math.min(yMax, webState.triggerLevelMv)) / yMax) * (canvas.height - 1)); ctx.strokeStyle = '#facc15'; ctx.lineWidth = 2; ctx.setLineDash([8,6]); ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#facc15'; ctx.fillText(`Trig ${(webState.triggerLevelMv / 1000).toFixed(3)} V`, 12, Math.max(50, y - 8)); }\n"
+    "    function drawTriggerOverlay() { if (webState.triggerRunMode === 0) return; const yMax = getYMaxMv(); const y = canvas.height - ((Math.max(0, Math.min(yMax, webState.triggerLevelMv)) / yMax) * (canvas.height - 1)); ctx.strokeStyle = '#facc15'; ctx.lineWidth = 2; ctx.setLineDash([8,6]); ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#facc15'; ctx.fillText(`Trig ${(webState.triggerLevelMv / 1000).toFixed(3)} V`, 12, Math.max(50, y - 8)); }\n"
     "    function drawCursorOverlay() { if (webState.cursorMode === 0) return; normalizeCursorState(); const yMax = getYMaxMv(); ctx.fillStyle = '#f8fafc'; if (webState.cursorMode === 1) { const count = Math.max(getActivePointCount() - 1, 1); const x1 = (cursorTimePos1 * (canvas.width - 1)) / count; const x2 = (cursorTimePos2 * (canvas.width - 1)) / count; ctx.strokeStyle = '#f472b6'; ctx.lineWidth = webState.cursorLine === 0 ? 3 : 2; ctx.beginPath(); ctx.moveTo(x1,0); ctx.lineTo(x1,canvas.height); ctx.stroke(); ctx.strokeStyle = '#a78bfa'; ctx.lineWidth = webState.cursorLine === 1 ? 3 : 2; ctx.beginPath(); ctx.moveTo(x2,0); ctx.lineTo(x2,canvas.height); ctx.stroke(); const t1 = (cursorTimePos1 / count) * getWindowUs(); const t2 = (cursorTimePos2 / count) * getWindowUs(); ctx.fillText(`T1 ${fmtUs(t1)}`, canvas.width - 210, 22); ctx.fillText(`T2 ${fmtUs(t2)}`, canvas.width - 210, 40); ctx.fillText(`Dt ${fmtUs(Math.abs(t2 - t1))}`, canvas.width - 210, 58); } else { const y1 = canvas.height - ((Math.max(0, Math.min(yMax, cursorVoltageMv1)) / yMax) * (canvas.height - 1)); const y2 = canvas.height - ((Math.max(0, Math.min(yMax, cursorVoltageMv2)) / yMax) * (canvas.height - 1)); ctx.strokeStyle = '#f472b6'; ctx.lineWidth = webState.cursorLine === 0 ? 3 : 2; ctx.beginPath(); ctx.moveTo(0,y1); ctx.lineTo(canvas.width,y1); ctx.stroke(); ctx.strokeStyle = '#a78bfa'; ctx.lineWidth = webState.cursorLine === 1 ? 3 : 2; ctx.beginPath(); ctx.moveTo(0,y2); ctx.lineTo(canvas.width,y2); ctx.stroke(); ctx.fillText(`V1 ${fmtMv(cursorVoltageMv1)}`, canvas.width - 210, 22); ctx.fillText(`V2 ${fmtMv(cursorVoltageMv2)}`, canvas.width - 210, 40); ctx.fillText(`DV ${fmtMv(Math.abs(cursorVoltageMv2 - cursorVoltageMv1))}`, canvas.width - 210, 58); } }\n"
     "    function renderScope(data = lastPayload) { drawGrid(); if (data) { const mode = webState.channel; if (mode === 0 || mode === 2) drawTrace(data.points_ch1, '#39ff14', getYMaxMv()); if (mode === 1 || mode === 2) drawTrace(data.points_ch2, '#38bdf8', getYMaxMv()); metaCh1.textContent = `RMS: ${fmtMv(calcRms(data.points_ch1))} | Pk+: ${fmtMv(calcMax(data.points_ch1))} | Pk-: ${fmtMv(calcMin(data.points_ch1))}`; metaCh2.textContent = `RMS: ${fmtMv(calcRms(data.points_ch2))} | Pk+: ${fmtMv(calcMax(data.points_ch2))} | Pk-: ${fmtMv(calcMin(data.points_ch2))}`; } drawTriggerOverlay(); drawCursorOverlay(); }\n"
     "    function buildScopeQuery() { const params = new URLSearchParams(); params.set('channel', String(webState.channel)); params.set('timebase', String(webState.timebase)); params.set('volts', String(webState.voltscale)); params.set('trigger', String(webState.triggerMode)); params.set('status', webState.paused ? '1' : '0'); params.set('triglvl', String(Math.round(webState.triggerLevelMv))); return params.toString(); }\n"
@@ -454,13 +454,13 @@ static const char s_scope_web_html[] =
     "    function applyLocalAutoSet() { const points = webState.channel === 1 ? (lastPayload ? lastPayload.points_ch2 : null) : (lastPayload ? lastPayload.points_ch1 : null); if (!points || !points.length) return; const peak = calcMax(points); for (let i = 0; i < VOLTSCALES_MV.length; i++) { if (peak <= VOLTSCALES_MV[i]) { webState.voltscale = i; break; } webState.voltscale = VOLTSCALES_MV.length - 1; } const freqHz = estimateFreqHz(points); if (freqHz > 0) { const desiredWindowUs = (1000000 / freqHz) * 4; for (let i = 0; i < TIMEBASES_US.length; i++) { if (desiredWindowUs <= TIMEBASES_US[i]) { webState.timebase = i; break; } webState.timebase = TIMEBASES_US.length - 1; } } webState.triggerLevelMv = Math.min(getYMaxMv(), Math.max(0, Math.round((calcMin(points) + calcMax(points)) / 2))); syncControls(); }\n"
     "    function getCanvasPos(evt) { const rect = canvas.getBoundingClientRect(); return { x: ((evt.clientX - rect.left) * canvas.width) / rect.width, y: ((evt.clientY - rect.top) * canvas.height) / rect.height }; }\n"
     "    function scheduleTriggerRefresh() { if (triggerFetchTimer) return; triggerFetchTimer = setTimeout(() => { triggerFetchTimer = null; postControls().then(() => refreshScope()).catch(console.error); }, 90); }\n"
-    "    canvas.addEventListener('pointerdown', evt => { const pos = getCanvasPos(evt); const yMax = getYMaxMv(); const pointCount = Math.max(getActivePointCount() - 1, 1); if (webState.cursorMode === 1) { const cursorPos = webState.cursorLine === 0 ? cursorTimePos1 : cursorTimePos2; const cursorX = (cursorPos * (canvas.width - 1)) / pointCount; if (Math.abs(pos.x - cursorX) <= 18) dragMode = 'cursor-time'; } else if (webState.cursorMode === 2) { const cursorMv = webState.cursorLine === 0 ? cursorVoltageMv1 : cursorVoltageMv2; const cursorY = canvas.height - ((cursorMv / yMax) * (canvas.height - 1)); if (Math.abs(pos.y - cursorY) <= 18) dragMode = 'cursor-voltage'; } else if (webState.triggerMode !== 0) { dragMode = 'trigger'; } if (dragMode) { canvas.setPointerCapture(evt.pointerId); evt.preventDefault(); } });\n"
+    "    canvas.addEventListener('pointerdown', evt => { const pos = getCanvasPos(evt); const yMax = getYMaxMv(); const pointCount = Math.max(getActivePointCount() - 1, 1); if (webState.cursorMode === 1) { const cursorPos = webState.cursorLine === 0 ? cursorTimePos1 : cursorTimePos2; const cursorX = (cursorPos * (canvas.width - 1)) / pointCount; if (Math.abs(pos.x - cursorX) <= 18) dragMode = 'cursor-time'; } else if (webState.cursorMode === 2) { const cursorMv = webState.cursorLine === 0 ? cursorVoltageMv1 : cursorVoltageMv2; const cursorY = canvas.height - ((cursorMv / yMax) * (canvas.height - 1)); if (Math.abs(pos.y - cursorY) <= 18) dragMode = 'cursor-voltage'; } else if (webState.triggerRunMode !== 0) { dragMode = 'trigger'; } if (dragMode) { canvas.setPointerCapture(evt.pointerId); evt.preventDefault(); } });\n"
     "    canvas.addEventListener('pointermove', evt => { if (!dragMode) return; evt.preventDefault(); const pos = getCanvasPos(evt); const yMax = getYMaxMv(); const pointCount = Math.max(getActivePointCount() - 1, 1); if (dragMode === 'cursor-time') { const idx = Math.max(0, Math.min(pointCount, Math.round((pos.x * pointCount) / Math.max(canvas.width - 1, 1)))); if (webState.cursorLine === 0) cursorTimePos1 = idx; else cursorTimePos2 = idx; renderScope(); } else if (dragMode === 'cursor-voltage') { const mv = Math.max(0, Math.min(yMax, Math.round(((canvas.height - 1 - pos.y) * yMax) / Math.max(canvas.height - 1, 1)))); if (webState.cursorLine === 0) cursorVoltageMv1 = mv; else cursorVoltageMv2 = mv; renderScope(); } else if (dragMode === 'trigger') { webState.triggerLevelMv = Math.max(0, Math.min(yMax, Math.round(((canvas.height - 1 - pos.y) * yMax) / Math.max(canvas.height - 1, 1)))); renderScope(); scheduleTriggerRefresh(); } });\n"
     "    function endDrag() { if (dragMode === 'trigger') postControls().then(() => refreshScope()).catch(console.error); dragMode = ''; }\n"
     "    canvas.addEventListener('pointerup', endDrag);\n"
     "    canvas.addEventListener('pointercancel', endDrag);\n"
-    "    canvas.addEventListener('touchmove', evt => { if (webState.cursorMode !== 0 || webState.triggerMode !== 0) evt.preventDefault(); }, { passive: false });\n"
-    "    document.addEventListener('touchmove', evt => { if (dragMode && (webState.cursorMode !== 0 || webState.triggerMode !== 0)) evt.preventDefault(); }, { passive: false });\n"
+    "    canvas.addEventListener('touchmove', evt => { if (webState.cursorMode !== 0 || webState.triggerRunMode !== 0) evt.preventDefault(); }, { passive: false });\n"
+    "    document.addEventListener('touchmove', evt => { if (dragMode && (webState.cursorMode !== 0 || webState.triggerRunMode !== 0)) evt.preventDefault(); }, { passive: false });\n"
     "    outputModeSel.addEventListener('change', () => { readControls(); setOutputMode(webState.outputMode).catch(console.error); });\n"
     "    commandModeSel.addEventListener('change', () => { readControls(); syncControls(); postControls().catch(console.error); });\n"
     "    channelSel.addEventListener('change', () => { readControls(); renderScope(); postControls().then(() => refreshScope()).catch(console.error); });\n"
@@ -610,8 +610,8 @@ static esp_err_t scope_web_get_view_state_from_req(httpd_req_t *req, scope_web_v
     }
     if (httpd_query_key_value(query, "trigger", value, sizeof(value)) == ESP_OK) {
         uint16_t trigger = (uint16_t)strtoul(value, NULL, 10);
-        if (trigger > (uint16_t)ADC_SCOPE_TRIGGER_FALL) {
-            trigger = (uint16_t)ADC_SCOPE_TRIGGER_FREE;
+        if (trigger < (uint16_t)ADC_SCOPE_TRIGGER_RISE || trigger > (uint16_t)ADC_SCOPE_TRIGGER_FALL) {
+            trigger = (uint16_t)ADC_SCOPE_TRIGGER_RISE;
         }
         out_state->trigger_mode = (adc_scope_trigger_mode_t)trigger;
     }
@@ -710,7 +710,10 @@ static esp_err_t scope_web_collect_payload(const scope_web_view_state_t *state,
 
     ESP_RETURN_ON_ERROR(adc_scope_get_sample_freq_hz(&out_payload->sample_freq_hz), TAG, "falha ao ler sample rate");
     ESP_RETURN_ON_ERROR(adc_scope_get_channel_count(&out_payload->channel_count), TAG, "falha ao ler canais");
-    if (!state->paused && state->trigger_mode <= (uint16_t)ADC_SCOPE_TRIGGER_FALL) {
+    if (!state->paused &&
+        state->trigger_run_mode != ADC_SCOPE_TRIGGER_RUN_OFF &&
+        state->trigger_mode >= ADC_SCOPE_TRIGGER_RISE &&
+        state->trigger_mode <= ADC_SCOPE_TRIGGER_FALL) {
         trigger_mode = (adc_scope_trigger_mode_t)state->trigger_mode;
     }
     ESP_RETURN_ON_ERROR(adc_scope_copy_chart_points_multi(dest_buffers,
@@ -881,15 +884,15 @@ static esp_err_t scope_web_control_handler(httpd_req_t *req)
         }
         if (httpd_query_key_value(query, "trigger", value, sizeof(value)) == ESP_OK) {
             uint16_t trigger = (uint16_t)strtoul(value, NULL, 10);
-            if (trigger > (uint16_t)ADC_SCOPE_TRIGGER_FALL) {
-                trigger = (uint16_t)ADC_SCOPE_TRIGGER_FREE;
+            if (trigger < (uint16_t)ADC_SCOPE_TRIGGER_RISE || trigger > (uint16_t)ADC_SCOPE_TRIGGER_FALL) {
+                trigger = (uint16_t)ADC_SCOPE_TRIGGER_RISE;
             }
             state.trigger_mode = (adc_scope_trigger_mode_t)trigger;
         }
         if (httpd_query_key_value(query, "trigrun", value, sizeof(value)) == ESP_OK) {
             uint16_t run_mode = (uint16_t)strtoul(value, NULL, 10);
             if (run_mode > (uint16_t)ADC_SCOPE_TRIGGER_RUN_SINGLE) {
-                run_mode = (uint16_t)ADC_SCOPE_TRIGGER_RUN_AUTO;
+                run_mode = (uint16_t)ADC_SCOPE_TRIGGER_RUN_OFF;
             }
             state.trigger_run_mode = (adc_scope_trigger_run_mode_t)run_mode;
         }

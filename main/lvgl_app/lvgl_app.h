@@ -23,8 +23,8 @@ typedef struct {
     uint16_t timebase_index;        /**< Índice da base de tempo selecionada. */
     uint16_t voltscale_index;       /**< Índice da escala vertical selecionada. */
     uint16_t trigger_channel_index; /**< Índice do canal de trigger selecionado. */
-    uint16_t trigger_mode;          /**< Trigger: 0=livre, 1=subida, 2=descida. */
-    uint16_t trigger_run_mode;      /**< Modo de execução do trigger. */
+    uint16_t trigger_mode;          /**< Borda do trigger: 1=subida, 2=descida. */
+    uint16_t trigger_run_mode;      /**< Modo do trigger: 0=off, 1=auto, 2=normal, 3=single. */
     bool paused;                    /**< Indica se a captura está pausada. */
 } lvgl_app_control_state_t;
 

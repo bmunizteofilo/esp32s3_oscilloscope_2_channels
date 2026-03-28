@@ -234,8 +234,8 @@ static lvgl_app_control_state_t s_shared_control_state = {
     .timebase_index = 1U,
     .voltscale_index = 5U,
     .trigger_channel_index = 0U,
-    .trigger_mode = 0U,
-    .trigger_run_mode = 0U,
+    .trigger_mode = (uint16_t)ADC_SCOPE_TRIGGER_RISE,
+    .trigger_run_mode = (uint16_t)ADC_SCOPE_TRIGGER_RUN_OFF,
     .paused = false,
 };
 
@@ -333,7 +333,7 @@ static uint16_t s_timebase_index = 1U;
 static uint16_t s_voltscale_index = 5U;
 
 /** @brief Modo de trigger atualmente selecionado. */
-static adc_scope_trigger_mode_t s_trigger_mode = ADC_SCOPE_TRIGGER_FREE;
+static adc_scope_trigger_mode_t s_trigger_mode = ADC_SCOPE_TRIGGER_RISE;
 
 /** @brief Índice do canal exibido atualmente no gráfico. */
 static uint16_t s_sample_channel_mode = 0U;
@@ -363,7 +363,7 @@ static int32_t s_cursor_voltage_mv_2 = 2200;
 static bool s_cursor_drag_active = false;
 
 /** @brief Modo de execução do trigger atualmente selecionado. */
-static adc_scope_trigger_run_mode_t s_trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_AUTO;
+static adc_scope_trigger_run_mode_t s_trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF;
 
 /** @brief Indica se a UI está em modo de pausa. */
 static bool s_scope_paused = false;
@@ -382,6 +382,9 @@ static size_t s_free_run_last_requested_samples = 0U;
 
 /** @brief Último modo de canal exibido usado pela varredura livre para detectar mudanças de configuração. */
 static uint16_t s_free_run_last_channel_mode = 0U;
+
+/** @brief Última sequência absoluta usada como referência do modo livre. */
+static uint64_t s_free_run_last_sequence = 0U;
 
 /** @brief Última posição X registrada ao iniciar um arraste horizontal. */
 static int16_t s_drag_start_x = 0;
@@ -438,6 +441,73 @@ static bool lvgl_timebase_allows_trigger(void)
 }
 
 /**
+ * @brief Informa se o trigger está habilitado pelo modo de execução atual.
+ *
+ * @return `true` quando o trigger não está em `Off`.
+ */
+static bool lvgl_trigger_run_enabled(void)
+{
+    return s_trigger_run_mode != ADC_SCOPE_TRIGGER_RUN_OFF;
+}
+
+/**
+ * @brief Retorna a borda de trigger efetivamente ativa para a captura.
+ *
+ * @return `ADC_SCOPE_TRIGGER_FREE` quando o trigger não deve atuar.
+ */
+static adc_scope_trigger_mode_t lvgl_get_active_trigger_mode(void)
+{
+    if (s_scope_paused || !lvgl_timebase_allows_trigger() || !lvgl_trigger_run_enabled()) {
+        return ADC_SCOPE_TRIGGER_FREE;
+    }
+
+    return s_trigger_mode;
+}
+
+/**
+ * @brief Retorna a histerese do trigger adequada para a base de tempo atual.
+ *
+ * @return Histerese em milivolts usada pelo detector de trigger.
+ */
+static uint32_t lvgl_get_trigger_hysteresis_mv(void)
+{
+    const uint32_t window_us = s_timebase_options[s_timebase_index].total_window_us;
+
+    if (window_us >= 250000U) {
+        return 80U;
+    }
+    if (window_us >= 100000U) {
+        return 40U;
+    }
+
+    return 20U;
+}
+
+/**
+ * @brief Converte o índice do dropdown local para a borda do trigger.
+ *
+ * @param[in] dropdown_index Índice selecionado no dropdown.
+ *
+ * @return Borda correspondente ao índice informado.
+ */
+static adc_scope_trigger_mode_t lvgl_trigger_mode_from_dropdown_index(uint16_t dropdown_index)
+{
+    return (dropdown_index == 0U) ? ADC_SCOPE_TRIGGER_RISE : ADC_SCOPE_TRIGGER_FALL;
+}
+
+/**
+ * @brief Converte a borda do trigger para o índice do dropdown local.
+ *
+ * @param[in] trigger_mode Borda atual do trigger.
+ *
+ * @return Índice que representa a borda no dropdown.
+ */
+static uint16_t lvgl_trigger_dropdown_index_from_mode(adc_scope_trigger_mode_t trigger_mode)
+{
+    return (trigger_mode == ADC_SCOPE_TRIGGER_FALL) ? 1U : 0U;
+}
+
+/**
  * @brief Mantém os indicadores visuais do trigger aparentes por um tempo mínimo.
  *
  * @param[in] hold_ms Tempo, em milissegundos, de permanência visual.
@@ -462,6 +532,7 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer);
  * @brief Atualiza a linha e o label visuais do nível de trigger.
  */
 static void lvgl_update_trigger_level_visuals(void);
+static void lvgl_sync_adc_trigger_monitor(void);
 
 /**
  * @brief Atualiza as cores da faixa inferior conforme o canal exibido.
@@ -728,13 +799,13 @@ static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *st
     s_voltscale_index = (state->voltscale_index < (uint16_t)(sizeof(s_voltscale_options) / sizeof(s_voltscale_options[0]))) ?
         state->voltscale_index : ((uint16_t)(sizeof(s_voltscale_options) / sizeof(s_voltscale_options[0])) - 1U);
     s_trigger_channel_index = (state->trigger_channel_index <= 1U) ? state->trigger_channel_index : 0U;
-    s_trigger_mode = (state->trigger_mode <= (uint16_t)ADC_SCOPE_TRIGGER_FALL) ?
-        (adc_scope_trigger_mode_t)state->trigger_mode : ADC_SCOPE_TRIGGER_FREE;
+    s_trigger_mode = (state->trigger_mode == (uint16_t)ADC_SCOPE_TRIGGER_FALL) ?
+        ADC_SCOPE_TRIGGER_FALL : ADC_SCOPE_TRIGGER_RISE;
     s_trigger_run_mode = (state->trigger_run_mode <= (uint16_t)ADC_SCOPE_TRIGGER_RUN_SINGLE) ?
-        (adc_scope_trigger_run_mode_t)state->trigger_run_mode : ADC_SCOPE_TRIGGER_RUN_AUTO;
+        (adc_scope_trigger_run_mode_t)state->trigger_run_mode : ADC_SCOPE_TRIGGER_RUN_OFF;
 
-    if (!lvgl_timebase_allows_trigger()) {
-        s_trigger_mode = ADC_SCOPE_TRIGGER_FREE;
+    if (!lvgl_timebase_allows_trigger() && lvgl_trigger_run_enabled()) {
+        s_trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF;
     }
 
     if (s_channel_dropdown != NULL) {
@@ -750,7 +821,7 @@ static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *st
         lv_dropdown_set_selected(s_trigger_channel_dropdown, s_trigger_channel_index);
     }
     if (s_trigger_dropdown != NULL) {
-        lv_dropdown_set_selected(s_trigger_dropdown, (uint16_t)s_trigger_mode);
+        lv_dropdown_set_selected(s_trigger_dropdown, lvgl_trigger_dropdown_index_from_mode(s_trigger_mode));
     }
     if (s_trigger_run_dropdown != NULL) {
         lv_dropdown_set_selected(s_trigger_run_dropdown, (uint16_t)s_trigger_run_mode);
@@ -1363,7 +1434,7 @@ static void lvgl_update_trigger_level_visuals(void)
         return;
     }
 
-    if (s_trigger_mode == ADC_SCOPE_TRIGGER_FREE || !lvgl_timebase_allows_trigger()) {
+    if (!lvgl_timebase_allows_trigger() || !lvgl_trigger_run_enabled()) {
         lv_obj_add_flag(s_trigger_level_line, LV_OBJ_FLAG_HIDDEN);
         if (s_trigger_level_label != NULL) {
             lv_obj_add_flag(s_trigger_level_label, LV_OBJ_FLAG_HIDDEN);
@@ -1396,6 +1467,27 @@ static void lvgl_update_trigger_level_visuals(void)
         lv_obj_remove_flag(s_trigger_level_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_align(s_trigger_level_label, LV_ALIGN_TOP_LEFT, 8, 52);
         lv_obj_move_to_index(s_trigger_level_label, -1);
+    }
+}
+
+/**
+ * @brief Sincroniza o monitor de trigger por hardware com o estado atual da UI.
+ */
+static void lvgl_sync_adc_trigger_monitor(void)
+{
+    const adc_scope_trigger_mode_t active_trigger_mode = lvgl_get_active_trigger_mode();
+    const size_t requested_samples = lvgl_get_requested_window_samples();
+    const adc_scope_trigger_run_mode_t active_trigger_run_mode =
+        s_scope_paused ? ADC_SCOPE_TRIGGER_RUN_OFF : s_trigger_run_mode;
+
+    if (adc_scope_configure_trigger_monitor(s_trigger_channel_index,
+                                            active_trigger_mode,
+                                            s_trigger_level_mv,
+                                            lvgl_get_trigger_hysteresis_mv(),
+                                            requested_samples,
+                                            LVGL_SCOPE_TRIGGER_POS,
+                                            active_trigger_run_mode) != ESP_OK) {
+        ESP_LOGW(TAG, "Falha ao sincronizar monitor de trigger");
     }
 }
 
@@ -1650,7 +1742,7 @@ static void lvgl_update_channel_measurements(const int32_t *points,
     }
     lvgl_set_metric_voltage_label(pk_neg_label, "Pk-", true, (min_mv == INT32_MAX) ? 0 : min_mv);
 
-    if (s_trigger_mode != ADC_SCOPE_TRIGGER_FREE &&
+    if (lvgl_get_active_trigger_mode() != ADC_SCOPE_TRIGGER_FREE &&
         s_scope_snapshot.trigger_found &&
         channel_index < ADC_SCOPE_MAX_CHANNELS &&
         s_scope_snapshot.measurements_valid[channel_index]) {
@@ -1724,9 +1816,9 @@ static void lvgl_update_measurements(void)
 static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
 {
     const size_t requested_samples = lvgl_get_requested_window_samples();
-    const adc_scope_trigger_mode_t active_trigger_mode =
-        (s_scope_paused || !lvgl_timebase_allows_trigger()) ? ADC_SCOPE_TRIGGER_FREE : s_trigger_mode;
-    const adc_scope_trigger_run_mode_t active_trigger_run_mode = s_scope_paused ? ADC_SCOPE_TRIGGER_RUN_AUTO : s_trigger_run_mode;
+    const adc_scope_trigger_mode_t active_trigger_mode = lvgl_get_active_trigger_mode();
+    const adc_scope_trigger_run_mode_t active_trigger_run_mode =
+        s_scope_paused ? ADC_SCOPE_TRIGGER_RUN_OFF : s_trigger_run_mode;
     const bool use_free_run_sweep =
         (!s_scope_paused &&
          active_trigger_mode == ADC_SCOPE_TRIGGER_FREE &&
@@ -1846,6 +1938,7 @@ static void lvgl_reset_free_run_sweep(void)
     s_free_run_visible_points = 0U;
     s_free_run_last_requested_samples = 0U;
     s_free_run_last_channel_mode = s_sample_channel_mode;
+    s_free_run_last_sequence = 0U;
 }
 
 /**
@@ -1867,8 +1960,14 @@ static void lvgl_publish_pending_points_full(void)
 static void lvgl_publish_pending_points_free_run(size_t requested_samples)
 {
     uint32_t sample_freq_hz = APP_ADC_SAMPLE_FREQ_HZ;
-    uint64_t new_samples_est = 0U;
+    uint64_t new_samples = 0U;
     size_t delta_points = 1U;
+    bool use_slow_incremental_scroll = false;
+    const bool ch1_visible = lvgl_channel_is_visible(0U);
+    const bool ch2_visible = lvgl_channel_is_visible(1U);
+    const size_t sequence_channel = (s_sample_channel_mode == 1U) ? 1U : 0U;
+    const uint64_t current_sequence =
+        (sequence_channel < ADC_SCOPE_MAX_CHANNELS) ? s_scope_snapshot.latest_sequence[sequence_channel] : 0U;
 
     if (!s_free_run_sweep_active ||
         s_free_run_last_requested_samples != requested_samples ||
@@ -1877,16 +1976,22 @@ static void lvgl_publish_pending_points_free_run(size_t requested_samples)
         s_free_run_sweep_active = true;
         s_free_run_last_requested_samples = requested_samples;
         s_free_run_last_channel_mode = s_sample_channel_mode;
+        s_free_run_last_sequence = current_sequence;
     }
 
     (void)adc_scope_get_sample_freq_hz(&sample_freq_hz);
-    new_samples_est = ((uint64_t)sample_freq_hz * (uint64_t)LVGL_SCOPE_REFRESH_MS) / 1000ULL;
-    if (new_samples_est == 0U) {
-        new_samples_est = 1U;
+    if (current_sequence > s_free_run_last_sequence) {
+        new_samples = current_sequence - s_free_run_last_sequence;
+    } else {
+        new_samples = ((uint64_t)sample_freq_hz * (uint64_t)LVGL_SCOPE_REFRESH_MS) / 1000ULL;
     }
+    if (new_samples == 0U) {
+        new_samples = 1U;
+    }
+    s_free_run_last_sequence = current_sequence;
 
     if (requested_samples > 0U) {
-        delta_points = (size_t)(((new_samples_est * APP_ADC_CHART_POINTS) + requested_samples - 1U) / requested_samples);
+        delta_points = (size_t)(((new_samples * APP_ADC_CHART_POINTS) + requested_samples - 1U) / requested_samples);
         if (delta_points == 0U) {
             delta_points = 1U;
         }
@@ -1894,6 +1999,8 @@ static void lvgl_publish_pending_points_free_run(size_t requested_samples)
             delta_points = APP_ADC_CHART_POINTS;
         }
     }
+
+    use_slow_incremental_scroll = (requested_samples >= (size_t)(sample_freq_hz / 4U));
 
     if (s_free_run_visible_points < APP_ADC_CHART_POINTS) {
         size_t visible_points = s_free_run_visible_points + delta_points;
@@ -1912,6 +2019,24 @@ static void lvgl_publish_pending_points_free_run(size_t requested_samples)
         }
 
         s_free_run_visible_points = visible_points;
+        return;
+    }
+
+    if (use_slow_incremental_scroll) {
+        if (delta_points >= APP_ADC_CHART_POINTS) {
+            lvgl_publish_pending_points_full();
+            return;
+        }
+
+        for (size_t i = 0; i < (APP_ADC_CHART_POINTS - delta_points); i++) {
+            s_chart_points[i] = s_chart_points[i + delta_points];
+            s_chart_points_ch2[i] = s_chart_points_ch2[i + delta_points];
+        }
+
+        for (size_t i = APP_ADC_CHART_POINTS - delta_points; i < APP_ADC_CHART_POINTS; i++) {
+            s_chart_points[i] = ch1_visible ? s_chart_points_pending[i] : INT32_MAX;
+            s_chart_points_ch2[i] = ch2_visible ? s_chart_points_pending_ch2[i] : INT32_MAX;
+        }
         return;
     }
 
@@ -1937,6 +2062,7 @@ static void lvgl_trigger_channel_dropdown_event_cb(lv_event_t *e)
         s_trigger_channel_index = 0U;
     }
 
+    lvgl_sync_adc_trigger_monitor();
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2020,14 +2146,17 @@ static void lvgl_timebase_dropdown_event_cb(lv_event_t *e)
         s_timebase_index = 0U;
     }
 
-    if (!lvgl_timebase_allows_trigger()) {
-        s_trigger_mode = ADC_SCOPE_TRIGGER_FREE;
+    if (!lvgl_timebase_allows_trigger() && lvgl_trigger_run_enabled()) {
+        s_trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF;
         s_trigger_visual_hold_until_us = 0;
-        if (s_trigger_dropdown != NULL) {
-            lv_dropdown_set_selected(s_trigger_dropdown, (uint16_t)ADC_SCOPE_TRIGGER_FREE);
+        if (s_trigger_run_dropdown != NULL) {
+            lv_dropdown_set_selected(s_trigger_run_dropdown, (uint16_t)ADC_SCOPE_TRIGGER_RUN_OFF);
         }
+        lvgl_set_center_notice("Trigger desabilitado\npara esta base de tempo");
+        lvgl_hold_center_notice(1800U);
     }
 
+    lvgl_sync_adc_trigger_monitor();
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2082,30 +2211,18 @@ static void lvgl_trigger_dropdown_event_cb(lv_event_t *e)
     }
 
     selected = (uint16_t)lv_dropdown_get_selected(lv_event_get_target_obj(e));
-    if (selected > (uint16_t)ADC_SCOPE_TRIGGER_FALL) {
-        selected = (uint16_t)ADC_SCOPE_TRIGGER_FREE;
+    if (selected > 1U) {
+        selected = 0U;
     }
 
-    if (selected != (uint16_t)ADC_SCOPE_TRIGGER_FREE && !lvgl_timebase_allows_trigger()) {
-        s_trigger_mode = ADC_SCOPE_TRIGGER_FREE;
-        s_trigger_visual_hold_until_us = 0;
-        if (s_trigger_dropdown != NULL) {
-            lv_dropdown_set_selected(s_trigger_dropdown, (uint16_t)ADC_SCOPE_TRIGGER_FREE);
-        }
-        lvgl_update_trigger_level_visuals();
-        lvgl_set_center_notice("Trigger desabilitado\npara esta base de tempo");
-        lvgl_hold_center_notice(1800U);
-        lvgl_scope_refresh_timer_cb(NULL);
-        return;
-    }
-
-    s_trigger_mode = (adc_scope_trigger_mode_t)selected;
-    if (s_trigger_mode != ADC_SCOPE_TRIGGER_FREE) {
+    s_trigger_mode = lvgl_trigger_mode_from_dropdown_index(selected);
+    if (lvgl_trigger_run_enabled() && lvgl_timebase_allows_trigger()) {
         lvgl_hold_trigger_visual(LVGL_TRIGGER_VISUAL_HOLD_MS);
     } else {
         s_trigger_visual_hold_until_us = 0;
     }
     lvgl_update_trigger_level_visuals();
+    lvgl_sync_adc_trigger_monitor();
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2128,10 +2245,26 @@ static void lvgl_trigger_run_dropdown_event_cb(lv_event_t *e)
 
     selected = (uint16_t)lv_dropdown_get_selected(lv_event_get_target_obj(e));
     if (selected > (uint16_t)ADC_SCOPE_TRIGGER_RUN_SINGLE) {
-        selected = (uint16_t)ADC_SCOPE_TRIGGER_RUN_AUTO;
+        selected = (uint16_t)ADC_SCOPE_TRIGGER_RUN_OFF;
+    }
+
+    if (selected != (uint16_t)ADC_SCOPE_TRIGGER_RUN_OFF && !lvgl_timebase_allows_trigger()) {
+        selected = (uint16_t)ADC_SCOPE_TRIGGER_RUN_OFF;
+        if (s_trigger_run_dropdown != NULL) {
+            lv_dropdown_set_selected(s_trigger_run_dropdown, selected);
+        }
+        lvgl_set_center_notice("Trigger desabilitado\npara esta base de tempo");
+        lvgl_hold_center_notice(1800U);
     }
 
     s_trigger_run_mode = (adc_scope_trigger_run_mode_t)selected;
+    if (lvgl_trigger_run_enabled()) {
+        lvgl_hold_trigger_visual(LVGL_TRIGGER_VISUAL_HOLD_MS);
+    } else {
+        s_trigger_visual_hold_until_us = 0;
+        lvgl_update_trigger_level_visuals();
+    }
+    lvgl_sync_adc_trigger_monitor();
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2168,6 +2301,7 @@ static void lvgl_status_dropdown_event_cb(lv_event_t *e)
         }
     }
 
+    lvgl_sync_adc_trigger_monitor();
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2267,6 +2401,10 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
         } else {
             s_scope_tap_count = 0U;
         }
+
+        if (!s_scope_paused && lvgl_get_active_trigger_mode() != ADC_SCOPE_TRIGGER_FREE) {
+            lvgl_sync_adc_trigger_monitor();
+        }
         return;
     }
 
@@ -2330,18 +2468,25 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
             return;
         }
 
-        if (!s_scope_paused && s_trigger_mode != ADC_SCOPE_TRIGGER_FREE) {
+        if (!s_scope_paused && lvgl_get_active_trigger_mode() != ADC_SCOPE_TRIGGER_FREE) {
+            int32_t new_trigger_level_mv = 0;
+
             if (height_px == 0U) {
                 return;
             }
 
             delta_mv = (int32_t)(((int64_t)(-delta_y) * (int64_t)lvgl_get_chart_y_max_mv()) / (int64_t)height_px);
-            s_trigger_level_mv = s_drag_start_trigger_level_mv + delta_mv;
-            if (s_trigger_level_mv < 0) {
-                s_trigger_level_mv = 0;
-            } else if (s_trigger_level_mv > lvgl_get_chart_y_max_mv()) {
-                s_trigger_level_mv = lvgl_get_chart_y_max_mv();
+            new_trigger_level_mv = s_drag_start_trigger_level_mv + delta_mv;
+            if (new_trigger_level_mv < 0) {
+                new_trigger_level_mv = 0;
+            } else if (new_trigger_level_mv > lvgl_get_chart_y_max_mv()) {
+                new_trigger_level_mv = lvgl_get_chart_y_max_mv();
             }
+
+            if (new_trigger_level_mv == s_trigger_level_mv) {
+                return;
+            }
+            s_trigger_level_mv = new_trigger_level_mv;
             lvgl_hold_trigger_visual(LVGL_TRIGGER_VISUAL_HOLD_MS);
             lvgl_scope_refresh_timer_cb(NULL);
             return;
@@ -2525,10 +2670,9 @@ static void lvgl_create_scope_ui(void)
 
     s_trigger_dropdown = lv_dropdown_create(trigger_group);
     lv_dropdown_set_options_static(s_trigger_dropdown,
-                                   "Off\n"
                                    "Subida\n"
                                    "Descida");
-    lv_dropdown_set_selected(s_trigger_dropdown, (uint16_t)s_trigger_mode);
+    lv_dropdown_set_selected(s_trigger_dropdown, lvgl_trigger_dropdown_index_from_mode(s_trigger_mode));
     lv_obj_set_size(s_trigger_dropdown, slot_width - 20, LV_SIZE_CONTENT);
     lv_obj_align_to(s_trigger_dropdown, trigger_caption, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
     lvgl_style_dropdown(s_trigger_dropdown, lv_color_hex(LVGL_COLOR_TRIGGER));
@@ -2546,6 +2690,7 @@ static void lvgl_create_scope_ui(void)
 
     s_trigger_run_dropdown = lv_dropdown_create(trigger_mode_group);
     lv_dropdown_set_options_static(s_trigger_run_dropdown,
+                                   "Off\n"
                                    "Auto\n"
                                    "Normal\n"
                                    "Single");

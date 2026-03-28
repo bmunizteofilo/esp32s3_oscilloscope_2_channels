@@ -50,13 +50,13 @@
 #define FT6336U_MIRROR_Y            (0)          /**< Mantém o eixo Y do touch no sentido natural para a navegação vertical em paisagem. */
 #define FT6336U_SKIP_RESET          (1)          /**< Não aplica reset dedicado no touch quando diferente de zero. Útil quando o reset é compartilhado com o LCD. */
 
-#define APP_ADC_SAMPLE_FREQ_HZ      (20000UL)      /**< Frequência alvo do ADC contínuo em hertz por canal. */
+#define APP_ADC_SAMPLE_FREQ_HZ      (40000UL)      /**< Frequência alvo do ADC contínuo em hertz por canal. */
 #define APP_ADC_UNIT               ADC_UNIT_1      /**< Unidade ADC usada pelo exemplo. */
 #define APP_ADC_CHANNEL_1          ADC_CHANNEL_9   /**< Canal 1 do exemplo, mapeado no ESP32-S3 para GPIO10. */
 #define APP_ADC_CHANNEL_2          ADC_CHANNEL_0   /**< Canal 2 do exemplo, mapeado no ESP32-S3 para GPIO01. */
 #define APP_ADC_ATTENUATION_1      ADC_ATTEN_DB_12 /**< Atenuação do canal 1 usada na conversão. */
 #define APP_ADC_ATTENUATION_2      ADC_ATTEN_DB_12 /**< Atenuação do canal 2 usada na conversão. */
-#define APP_ADC_HISTORY_SAMPLES     (20000U)      /**< Quantidade de amostras retidas no histórico circular para a base de tempo. */
+#define APP_ADC_HISTORY_SAMPLES     (60000U)      /**< Quantidade de amostras retidas no histórico circular para a base de tempo. */
 #define APP_ADC_CHART_POINTS        (470U)       /**< Quantidade de pontos exibidos no gráfico do osciloscópio. */
 #define APP_ADC_BLOCK_SAMPLES       (240U)       /**< Quantidade padrão de amostras em uma captura por bloco. */
 #define APP_ADC_DMA_FRAME_BYTES     (256U)       /**< Tamanho do frame DMA do ADC em bytes. */
