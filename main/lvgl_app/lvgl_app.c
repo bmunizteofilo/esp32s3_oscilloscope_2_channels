@@ -33,10 +33,10 @@ static const char *TAG = "lvgl_app";
 #define LVGL_SPLASH_DURATION_MS (5000U)
 
 /** @brief Quantidade de divisões horizontais usada para a base de tempo. */
-#define LVGL_SCOPE_TIME_DIVS    (8U)
+#define LVGL_SCOPE_TIME_DIVS    (10U)
 
 /** @brief Quantidade de linhas verticais internas desenhadas na grade do chart. */
-#define LVGL_SCOPE_TIME_GRID_LINES (9U)
+#define LVGL_SCOPE_TIME_GRID_LINES (11U)
 
 /** @brief Quantidade de linhas horizontais internas desenhadas na grade do chart. */
 #define LVGL_SCOPE_VOLT_GRID_LINES (5U)
@@ -440,7 +440,7 @@ static void lvgl_make_chart_overlay_passthrough(lv_obj_t *obj)
  */
 static bool lvgl_timebase_allows_trigger(void)
 {
-    return s_timebase_options[s_timebase_index].total_window_us < 500000U;
+    return s_timebase_options[s_timebase_index].total_window_us < 1000000U;
 }
 
 /**
