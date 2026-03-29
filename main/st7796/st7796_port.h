@@ -28,6 +28,7 @@
 #define ST7796_DRAW_BUFFER_LINES    (40U)        /**< Quantidade de linhas por bloco no buffer de desenho em RAM interna. */
 #define ST7796_LVGL_TASK_STACK_SIZE (8192U)      /**< Tamanho da stack da task dedicada ao LVGL em bytes. */
 #define ST7796_LVGL_TASK_PRIORITY   (4U)         /**< Prioridade da task dedicada ao LVGL. */
+#define ST7796_LVGL_TASK_CORE_ID    (1)          /**< Core usado pela task dedicada ao LVGL. */
 #define ST7796_X_GAP                (0U)         /**< Offset horizontal aplicado ao programar a janela de escrita. */
 #define ST7796_Y_GAP                (0U)         /**< Offset vertical aplicado ao programar a janela de escrita. */
 #define ST7796_SWAP_XY              (1)          /**< Troca os eixos X e Y via registrador MADCTL para usar o painel em paisagem. */
@@ -49,16 +50,23 @@
 #define FT6336U_MIRROR_Y            (0)          /**< Mantém o eixo Y do touch no sentido natural para a navegação vertical em paisagem. */
 #define FT6336U_SKIP_RESET          (1)          /**< Não aplica reset dedicado no touch quando diferente de zero. Útil quando o reset é compartilhado com o LCD. */
 
-#define APP_ADC_SAMPLE_FREQ_HZ      (20000UL)      /**< Frequência alvo do ADC contínuo em hertz por canal. */
+#define APP_ADC_SAMPLE_FREQ_HZ      (40000UL)      /**< Frequência alvo do ADC contínuo em hertz por canal. */
 #define APP_ADC_UNIT               ADC_UNIT_1      /**< Unidade ADC usada pelo exemplo. */
 #define APP_ADC_CHANNEL_1          ADC_CHANNEL_9   /**< Canal 1 do exemplo, mapeado no ESP32-S3 para GPIO10. */
 #define APP_ADC_CHANNEL_2          ADC_CHANNEL_0   /**< Canal 2 do exemplo, mapeado no ESP32-S3 para GPIO01. */
 #define APP_ADC_ATTENUATION_1      ADC_ATTEN_DB_12 /**< Atenuação do canal 1 usada na conversão. */
 #define APP_ADC_ATTENUATION_2      ADC_ATTEN_DB_12 /**< Atenuação do canal 2 usada na conversão. */
-#define APP_ADC_HISTORY_SAMPLES     (20000U)      /**< Quantidade de amostras retidas no histórico circular para a base de tempo. */
-#define APP_ADC_CHART_POINTS        (240U)       /**< Quantidade de pontos exibidos no gráfico do osciloscópio. */
+#define APP_ADC_HISTORY_SAMPLES     (60000U)      /**< Quantidade de amostras retidas no histórico circular para a base de tempo. */
+#define APP_ADC_CHART_POINTS        (470U)       /**< Quantidade de pontos exibidos no gráfico do osciloscópio. */
 #define APP_ADC_BLOCK_SAMPLES       (240U)       /**< Quantidade padrão de amostras em uma captura por bloco. */
 #define APP_ADC_DMA_FRAME_BYTES     (256U)       /**< Tamanho do frame DMA do ADC em bytes. */
 #define APP_ADC_STORE_BUFFER_BYTES  (2048U)      /**< Tamanho do pool interno do driver contínuo do ADC em bytes. */
 #define APP_ADC_TASK_STACK_SIZE     (4096U)      /**< Tamanho da stack da task de aquisição ADC em bytes. */
 #define APP_ADC_TASK_PRIORITY       (5U)         /**< Prioridade da task dedicada à captura ADC. */
+
+#define APP_WEB_ENABLED             (1)                 /**< Habilita a interface web via SoftAP quando diferente de zero. */
+#define APP_WEB_SOFTAP_SSID         "MiniOsciloscopio" /**< SSID publicado pelo modo SoftAP do ESP32-S3. */
+#define APP_WEB_SOFTAP_PASSWORD     "12345678"         /**< Senha WPA2 do SoftAP. Use string vazia para rede aberta. */
+#define APP_WEB_SOFTAP_CHANNEL      (6)                /**< Canal Wi-Fi usado pelo SoftAP. */
+#define APP_WEB_SOFTAP_MAX_CONN     (4)                /**< Quantidade máxima de clientes conectados ao SoftAP. */
+#define APP_WEB_HTTPD_CORE_ID       (0)                /**< Core preferencial do servidor HTTP da interface web. */

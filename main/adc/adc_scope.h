@@ -39,7 +39,8 @@ typedef enum {
  * @brief Modos de execução do sistema de trigger.
  */
 typedef enum {
-    ADC_SCOPE_TRIGGER_RUN_AUTO = 0,   /**< Atualiza a tela mesmo sem trigger válido. */
+    ADC_SCOPE_TRIGGER_RUN_OFF = 0,    /**< Trigger desligado; a tela se comporta como modo livre. */
+    ADC_SCOPE_TRIGGER_RUN_AUTO,       /**< Atualiza a tela mesmo sem trigger válido. */
     ADC_SCOPE_TRIGGER_RUN_NORMAL,     /**< Só atualiza a tela quando encontra trigger válido. */
     ADC_SCOPE_TRIGGER_RUN_SINGLE,     /**< Para a aquisição após o primeiro trigger válido. */
 } adc_scope_trigger_run_mode_t;
@@ -73,6 +74,7 @@ typedef struct {
     size_t capacity;                                        /**< Capacidade total do gráfico. */
     size_t history_count;                                   /**< Quantidade total de amostras disponíveis no histórico atual. */
     size_t history_capacity;                                /**< Capacidade total do buffer de histórico atual. */
+    uint64_t latest_sequence[ADC_SCOPE_MAX_CHANNELS];       /**< Sequência absoluta mais recente processada por canal. */
     uint32_t latest_raw[ADC_SCOPE_MAX_CHANNELS];            /**< Última amostra bruta recebida por canal. */
     int32_t latest_mv[ADC_SCOPE_MAX_CHANNELS];              /**< Última amostra convertida para milivolts por canal. */
     int32_t min_mv[ADC_SCOPE_MAX_CHANNELS];                 /**< Menor valor da janela atual em milivolts por canal. */
@@ -178,6 +180,15 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
 esp_err_t adc_scope_get_sample_freq_hz(uint32_t *out_sample_freq_hz);
 
 /**
+ * @brief Reconfigura a frequência de amostragem por canal do ADC contínuo.
+ *
+ * @param[in] sample_freq_hz Nova frequência desejada em hertz por canal.
+ *
+ * @return `ESP_OK` em caso de sucesso.
+ */
+esp_err_t adc_scope_set_sample_freq_hz(uint32_t sample_freq_hz);
+
+/**
  * @brief Retorna a quantidade de canais configurados.
  *
  * @param[out] out_channel_count Quantidade de canais habilitados.
@@ -195,6 +206,24 @@ esp_err_t adc_scope_get_channel_count(size_t *out_channel_count);
  * @return `ESP_OK` em caso de sucesso.
  */
 esp_err_t adc_scope_get_gpio_num(size_t channel_index, int *out_gpio);
+
+/**
+ * @brief Configura o monitor de trigger por hardware do ADC contínuo.
+ *
+ * @param[in] trigger_channel_index Índice lógico do canal usado como fonte do trigger.
+ * @param[in] trigger_mode Tipo de borda desejada. Use `ADC_SCOPE_TRIGGER_FREE` para desabilitar.
+ * @param[in] trigger_level_mv Nível de trigger em milivolts.
+ * @param[in] trigger_hysteresis_mv Histerese em milivolts. Use `0` para automático.
+ *
+ * @return `ESP_OK` em caso de sucesso.
+ */
+esp_err_t adc_scope_configure_trigger_monitor(size_t trigger_channel_index,
+                                              adc_scope_trigger_mode_t trigger_mode,
+                                              int32_t trigger_level_mv,
+                                              uint32_t trigger_hysteresis_mv,
+                                              size_t requested_samples,
+                                              size_t trigger_point_index,
+                                              adc_scope_trigger_run_mode_t trigger_run_mode);
 
 #ifdef __cplusplus
 }
