@@ -401,6 +401,12 @@ static bool s_capture_resume_wait_full_window = false;
 /** @brief Quando verdadeiro, o pause congela exatamente a imagem atual sem redesenhar. */
 static bool s_pause_display_locked = false;
 
+/** @brief Sequência absoluta do fim da janela congelada quando o pause foi ativado. */
+static uint64_t s_pause_anchor_sequence = 0U;
+
+/** @brief Canal de referência usado para fixar a navegação no histórico durante o pause. */
+static size_t s_pause_anchor_channel = 0U;
+
 /** @brief Última posição X registrada ao iniciar um arraste horizontal. */
 static int16_t s_drag_start_x = 0;
 
@@ -975,12 +981,19 @@ static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *st
         if (state->paused) {
             s_scope_paused = true;
             s_history_offset_samples = 0U;
+            (void)adc_scope_freeze_history_snapshot();
+            s_pause_anchor_channel = (s_sample_channel_mode == 1U) ? 1U : 0U;
+            s_pause_anchor_sequence =
+                (s_pause_anchor_channel < ADC_SCOPE_MAX_CHANNELS) ?
+                    s_scope_snapshot.latest_sequence[s_pause_anchor_channel] : 0U;
             s_pause_display_locked = true;
             s_capture_resume_settle_refreshes = 0U;
             s_capture_resume_wait_full_window = false;
         } else {
             s_scope_paused = false;
             s_history_offset_samples = 0U;
+            (void)adc_scope_release_history_snapshot();
+            s_pause_anchor_sequence = 0U;
             s_pause_display_locked = false;
             lvgl_invalidate_free_run_state(false);
             s_capture_resume_settle_refreshes = 0U;
@@ -1158,6 +1171,8 @@ static bool lvgl_try_estimate_frequency_from_history(size_t analysis_channel, ui
                                               ADC_SCOPE_TRIGGER_RUN_AUTO,
                                               s_trigger_channel_index,
                                               LVGL_SCOPE_TRIGGER_POS,
+                                              0U,
+                                              false,
                                               0U,
                                               s_trigger_level_mv,
                                               0U,
@@ -2023,6 +2038,8 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
                                           s_trigger_channel_index,
                                           LVGL_SCOPE_TRIGGER_POS,
                                           effective_history_offset_samples,
+                                          s_scope_paused,
+                                          s_pause_anchor_sequence,
                                           s_trigger_level_mv,
                                           0U,
                                           &next_snapshot) != ESP_OK) {
@@ -2512,6 +2529,8 @@ static void lvgl_status_dropdown_event_cb(lv_event_t *e)
     if (selected == 0U) {
         s_history_offset_samples = 0U;
         s_scope_paused = false;
+        (void)adc_scope_release_history_snapshot();
+        s_pause_anchor_sequence = 0U;
         s_pause_display_locked = false;
         lvgl_invalidate_free_run_state(false);
         s_capture_resume_settle_refreshes = 0U;
@@ -2519,6 +2538,11 @@ static void lvgl_status_dropdown_event_cb(lv_event_t *e)
     } else {
         s_scope_paused = true;
         s_history_offset_samples = 0U;
+        (void)adc_scope_freeze_history_snapshot();
+        s_pause_anchor_channel = (s_sample_channel_mode == 1U) ? 1U : 0U;
+        s_pause_anchor_sequence =
+            (s_pause_anchor_channel < ADC_SCOPE_MAX_CHANNELS) ?
+                s_scope_snapshot.latest_sequence[s_pause_anchor_channel] : 0U;
         s_pause_display_locked = true;
         s_capture_resume_settle_refreshes = 0U;
         s_capture_resume_wait_full_window = false;

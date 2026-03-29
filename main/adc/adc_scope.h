@@ -167,6 +167,8 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
                                             size_t trigger_channel_index,
                                             size_t trigger_point_index,
                                             size_t history_offset_samples,
+                                            bool anchor_to_sequence,
+                                            uint64_t anchor_sequence,
                                             int32_t trigger_level_mv,
                                             uint32_t trigger_hysteresis_mv,
                                             adc_scope_snapshot_t *out_snapshot);
@@ -186,6 +188,10 @@ esp_err_t adc_scope_get_sample_freq_hz(uint32_t *out_sample_freq_hz);
  * @return `ESP_OK` em caso de sucesso.
  */
 esp_err_t adc_scope_clear_history(void);
+
+esp_err_t adc_scope_freeze_history_snapshot(void);
+
+esp_err_t adc_scope_release_history_snapshot(void);
 
 /**
  * @brief Reconfigura a frequência de amostragem por canal do ADC contínuo.

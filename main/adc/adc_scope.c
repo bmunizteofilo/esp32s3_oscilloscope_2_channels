@@ -43,9 +43,11 @@ typedef struct {
     uint8_t *read_buffer;                                      /**< Buffer temporário para leitura do driver contínuo. */
     int16_t *circular_mv_buffer[ADC_SCOPE_MAX_CHANNELS];       /**< Buffer circular de tensão em milivolts por canal. */
     int16_t *block_mv_buffer[ADC_SCOPE_MAX_CHANNELS];          /**< Buffer usado na captura em bloco por canal. */
+    int16_t *pause_mv_buffer[ADC_SCOPE_MAX_CHANNELS];          /**< Cópia congelada do histórico para navegação em pause. */
     size_t circular_head[ADC_SCOPE_MAX_CHANNELS];              /**< Próxima posição de escrita no buffer circular de cada canal. */
     size_t circular_count[ADC_SCOPE_MAX_CHANNELS];             /**< Quantidade válida de amostras no buffer circular de cada canal. */
     size_t block_count[ADC_SCOPE_MAX_CHANNELS];                /**< Quantidade válida de amostras no buffer em bloco de cada canal. */
+    size_t pause_count;                                        /**< Quantidade compartilhada de amostras congeladas no snapshot de pause. */
     size_t block_target;                                       /**< Quantidade alvo da captura em bloco corrente. */
     adc_scope_mode_t mode;                                     /**< Modo de aquisição ativo. */
     bool initialized;                                          /**< Indica se o módulo já foi inicializado. */
@@ -60,6 +62,7 @@ typedef struct {
     int gpio_num[ADC_SCOPE_MAX_CHANNELS];                      /**< GPIO físico associado a cada canal configurado. */
     esp_err_t control_result;                                  /**< Resultado do último comando de start/stop. */
     uint64_t sample_sequence[ADC_SCOPE_MAX_CHANNELS];          /**< Sequência absoluta de amostras processadas por canal. */
+    uint64_t pause_latest_sequence[ADC_SCOPE_MAX_CHANNELS];    /**< Última sequência correspondente ao snapshot congelado. */
     uint64_t continuity_start_sequence[ADC_SCOPE_MAX_CHANNELS];/**< Primeira sequência válida do trecho contínuo atual por canal. */
     int32_t prev_mv[ADC_SCOPE_MAX_CHANNELS];                   /**< Última amostra por canal para detectar cruzamentos refinados. */
     bool prev_mv_valid[ADC_SCOPE_MAX_CHANNELS];                /**< Indica se prev_mv já foi inicializado por canal. */
@@ -99,6 +102,7 @@ typedef struct {
     size_t trigger_config_requested_samples;                   /**< Janela configurada para o trigger. */
     size_t trigger_config_trigger_point_index;                 /**< Posição de trigger configurada. */
     adc_scope_trigger_run_mode_t trigger_config_run_mode;      /**< Run mode configurado para o trigger. */
+    bool pause_snapshot_valid;                                 /**< Indica se existe uma cópia congelada do histórico. */
 } adc_scope_state_t;
 
 /** @brief Estado global do módulo. Mantido em RAM interna para interação com ISR. */
@@ -1075,10 +1079,12 @@ esp_err_t adc_scope_init(const adc_scope_config_t *config)
     for (size_t i = 0; i < config->channel_count; i++) {
         s_scope.circular_mv_buffer[i] = calloc(config->circular_buffer_capacity, sizeof(int16_t));
         s_scope.block_mv_buffer[i] = calloc(config->chart_point_count, sizeof(int16_t));
+        s_scope.pause_mv_buffer[i] = calloc(config->circular_buffer_capacity, sizeof(int16_t));
         s_scope.trigger_cache_points[i] = calloc(config->chart_point_count, sizeof(int32_t));
         s_scope.trigger_sweep_mv_buffer[i] = calloc(config->circular_buffer_capacity, sizeof(int16_t));
         ESP_GOTO_ON_FALSE(s_scope.circular_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar buffer circular");
         ESP_GOTO_ON_FALSE(s_scope.block_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar buffer bloco");
+        ESP_GOTO_ON_FALSE(s_scope.pause_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar buffer de pause");
         ESP_GOTO_ON_FALSE(s_scope.trigger_cache_points[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar cache de trigger");
         ESP_GOTO_ON_FALSE(s_scope.trigger_sweep_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar sweep de trigger");
     }
@@ -1171,6 +1177,10 @@ err:
         if (s_scope.block_mv_buffer[i] != NULL) {
             free(s_scope.block_mv_buffer[i]);
             s_scope.block_mv_buffer[i] = NULL;
+        }
+        if (s_scope.pause_mv_buffer[i] != NULL) {
+            free(s_scope.pause_mv_buffer[i]);
+            s_scope.pause_mv_buffer[i] = NULL;
         }
         if (s_scope.circular_mv_buffer[i] != NULL) {
             free(s_scope.circular_mv_buffer[i]);
@@ -1336,6 +1346,8 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
                                             size_t trigger_channel_index,
                                             size_t trigger_point_index,
                                             size_t history_offset_samples,
+                                            bool anchor_to_sequence,
+                                            uint64_t anchor_sequence,
                                             int32_t trigger_level_mv,
                                             uint32_t trigger_hysteresis_mv,
                                             adc_scope_snapshot_t *out_snapshot)
@@ -1343,6 +1355,7 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
     const adc_scope_trigger_mode_t requested_trigger_mode = trigger_mode;
     adc_scope_snapshot_t snapshot = {0};
     size_t oldest_start[ADC_SCOPE_MAX_CHANNELS] = {0};
+    size_t source_window_start[ADC_SCOPE_MAX_CHANNELS] = {0};
     size_t count = 0U;
     size_t window_start = 0U;
     size_t window_len = 0U;
@@ -1350,6 +1363,9 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
     uint64_t window_start_fp = 0U;
     bool circular_source = false;
     bool trigger_cache_compatible = false;
+    uint64_t shared_oldest_sequence = 0U;
+    uint64_t shared_newest_sequence = 0U;
+    bool shared_sequence_valid = false;
 
     ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
     ESP_RETURN_ON_FALSE(dest_per_channel != NULL, ESP_ERR_INVALID_ARG, TAG, "destinos nulos");
@@ -1403,15 +1419,103 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
         s_scope.trigger_cache_channel_index == trigger_channel_index &&
         s_scope.trigger_cache_mode == trigger_mode;
 
+    if (anchor_to_sequence && s_scope.pause_snapshot_valid) {
+        count = s_scope.pause_count;
+        snapshot.history_count = count;
+        snapshot.history_capacity = s_scope.config.circular_buffer_capacity;
+
+        if (history_offset_samples > count) {
+            history_offset_samples = count;
+        }
+
+        if (count > history_offset_samples) {
+            count -= history_offset_samples;
+        } else {
+            count = 0U;
+        }
+
+        window_len = (requested_samples < count) ? requested_samples : count;
+        window_start = (count > window_len) ? (count - window_len) : 0U;
+        snapshot.sample_count = window_len;
+
+        for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+            snapshot.latest_sequence[i] = s_scope.pause_latest_sequence[i];
+            snapshot.latest_raw[i] = 0U;
+            snapshot.latest_mv[i] = (s_scope.pause_count > 0U) ? (int32_t)s_scope.pause_mv_buffer[i][s_scope.pause_count - 1U] : 0;
+            if (s_scope.pause_count > 0U) {
+                const uint64_t oldest_sequence = s_scope.pause_latest_sequence[i] - (s_scope.pause_count - 1U);
+                snapshot.window_start_fp_q10[i] = (oldest_sequence + window_start) * 1024ULL;
+            }
+
+            if (dest_per_channel[i] != NULL) {
+                for (size_t j = 0; j < point_count; j++) {
+                    dest_per_channel[i][j] = INT32_MAX;
+                }
+            }
+
+            adc_scope_render_linear_buffer(s_scope.pause_mv_buffer[i] + window_start,
+                                           window_len,
+                                           dest_per_channel[i],
+                                           point_count,
+                                           &snapshot.min_mv[i],
+                                           &snapshot.max_mv[i]);
+
+            adc_scope_measure_linear_buffer(s_scope.pause_mv_buffer[i] + window_start,
+                                            window_len,
+                                            snapshot.trigger_level_mv,
+                                            &snapshot.frequency_tenths_hz[i],
+                                            &snapshot.duty_tenths_percent[i],
+                                            &snapshot.measurements_valid[i]);
+        }
+
+        xSemaphoreGive(s_scope.mutex);
+
+        if (out_snapshot != NULL) {
+            *out_snapshot = snapshot;
+        }
+        return ESP_OK;
+    }
+
     for (size_t i = 0; i < s_scope.config.channel_count; i++) {
         if (circular_source) {
             oldest_start[i] = (s_scope.circular_head[i] + s_scope.config.circular_buffer_capacity - s_scope.circular_count[i]) % s_scope.config.circular_buffer_capacity;
+            if (s_scope.circular_count[i] > 0U) {
+                const uint64_t channel_oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
+                const uint64_t channel_newest_sequence = s_scope.sample_sequence[i];
+
+                if (!shared_sequence_valid) {
+                    shared_oldest_sequence = channel_oldest_sequence;
+                    shared_newest_sequence = channel_newest_sequence;
+                    shared_sequence_valid = true;
+                } else {
+                    if (channel_oldest_sequence > shared_oldest_sequence) {
+                        shared_oldest_sequence = channel_oldest_sequence;
+                    }
+                    if (channel_newest_sequence < shared_newest_sequence) {
+                        shared_newest_sequence = channel_newest_sequence;
+                    }
+                }
+            }
         }
     }
 
     if (history_offset_samples > count) {
         history_offset_samples = count;
     }
+
+    if (anchor_to_sequence && circular_source && shared_sequence_valid) {
+        if (anchor_sequence > shared_newest_sequence) {
+            anchor_sequence = shared_newest_sequence;
+        }
+
+        if (anchor_sequence >= shared_oldest_sequence) {
+            count = (size_t)(anchor_sequence - shared_oldest_sequence + 1ULL);
+        } else {
+            count = 0U;
+        }
+    }
+
+    snapshot.history_count = count;
 
     if (count > history_offset_samples) {
         count -= history_offset_samples;
@@ -1487,9 +1591,15 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
 
     snapshot.sample_count = window_len;
     for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        source_window_start[i] = window_start;
+        if (anchor_to_sequence && circular_source && shared_sequence_valid && s_scope.circular_count[i] > 0U) {
+            const uint64_t channel_oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
+            source_window_start[i] += (size_t)(shared_oldest_sequence - channel_oldest_sequence);
+        }
+
         if (circular_source && s_scope.circular_count[i] > 0U) {
             const uint64_t oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
-            snapshot.window_start_fp_q10[i] = (oldest_sequence * 1024ULL) + window_start_fp;
+            snapshot.window_start_fp_q10[i] = (oldest_sequence * 1024ULL) + ((uint64_t)source_window_start[i] * 1024ULL);
         } else {
             snapshot.window_start_fp_q10[i] = window_start_fp;
         }
@@ -1503,9 +1613,9 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
         adc_scope_render_window_locked(i,
                                        circular_source,
                                        oldest_start[i],
-                                       window_start,
+                                       source_window_start[i],
                                        window_len,
-                                       window_start_fp,
+                                       (uint64_t)source_window_start[i] * 1024ULL,
                                        dest_per_channel[i],
                                        render_point_count,
                                        &snapshot.min_mv[i],
@@ -1514,7 +1624,7 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
         adc_scope_measure_window_locked(i,
                                         circular_source,
                                         oldest_start[i],
-                                        window_start,
+                                        source_window_start[i],
                                         window_len,
                                         snapshot.trigger_level_mv,
                                         &snapshot.frequency_tenths_hz[i],
@@ -1642,6 +1752,7 @@ esp_err_t adc_scope_clear_history(void)
         s_scope.circular_count[i] = 0U;
         s_scope.block_count[i] = 0U;
         s_scope.sample_sequence[i] = 0U;
+        s_scope.pause_latest_sequence[i] = 0U;
         s_scope.continuity_start_sequence[i] = 1U;
         s_scope.latest_raw[i] = 0U;
         s_scope.latest_mv[i] = 0U;
@@ -1649,9 +1760,70 @@ esp_err_t adc_scope_clear_history(void)
     }
 
     s_scope.block_capture_ready = false;
+    s_scope.pause_count = 0U;
+    s_scope.pause_snapshot_valid = false;
     s_scope.trigger_cache_valid = false;
     s_scope.discard_frames_remaining = 4U;
     adc_scope_reset_trigger_events_locked();
+
+    xSemaphoreGive(s_scope.mutex);
+    return ESP_OK;
+}
+
+esp_err_t adc_scope_freeze_history_snapshot(void)
+{
+    size_t oldest_start[ADC_SCOPE_MAX_CHANNELS] = {0};
+    size_t count = 0U;
+    bool circular_source = false;
+
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    circular_source = (s_scope.mode == ADC_SCOPE_MODE_CIRCULAR);
+    count = adc_scope_get_shared_count_locked(circular_source);
+    if (circular_source) {
+        const size_t contiguous_count = adc_scope_get_shared_contiguous_tail_count_locked();
+        if (contiguous_count < count) {
+            count = contiguous_count;
+        }
+    }
+
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        if (circular_source) {
+            oldest_start[i] = (s_scope.circular_head[i] + s_scope.config.circular_buffer_capacity - s_scope.circular_count[i]) %
+                              s_scope.config.circular_buffer_capacity;
+        }
+
+        for (size_t j = 0; j < count; j++) {
+            s_scope.pause_mv_buffer[i][j] =
+                (int16_t)adc_scope_get_source_sample_locked(i, circular_source, oldest_start[i], j);
+        }
+        s_scope.pause_latest_sequence[i] = s_scope.sample_sequence[i];
+    }
+
+    s_scope.pause_count = count;
+    s_scope.pause_snapshot_valid = true;
+
+    xSemaphoreGive(s_scope.mutex);
+    return ESP_OK;
+}
+
+esp_err_t adc_scope_release_history_snapshot(void)
+{
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    s_scope.pause_count = 0U;
+    s_scope.pause_snapshot_valid = false;
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        s_scope.pause_latest_sequence[i] = 0U;
+    }
 
     xSemaphoreGive(s_scope.mutex);
     return ESP_OK;
