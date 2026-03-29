@@ -75,6 +75,7 @@ typedef struct {
     size_t history_count;                                   /**< Quantidade total de amostras disponíveis no histórico atual. */
     size_t history_capacity;                                /**< Capacidade total do buffer de histórico atual. */
     uint64_t latest_sequence[ADC_SCOPE_MAX_CHANNELS];       /**< Sequência absoluta mais recente processada por canal. */
+    uint64_t window_start_fp_q10[ADC_SCOPE_MAX_CHANNELS];   /**< Início absoluto da janela renderizada em amostras Q10 por canal. */
     uint32_t latest_raw[ADC_SCOPE_MAX_CHANNELS];            /**< Última amostra bruta recebida por canal. */
     int32_t latest_mv[ADC_SCOPE_MAX_CHANNELS];              /**< Última amostra convertida para milivolts por canal. */
     int32_t min_mv[ADC_SCOPE_MAX_CHANNELS];                 /**< Menor valor da janela atual em milivolts por canal. */
@@ -178,6 +179,13 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
  * @return `ESP_OK` em caso de sucesso.
  */
 esp_err_t adc_scope_get_sample_freq_hz(uint32_t *out_sample_freq_hz);
+
+/**
+ * @brief Limpa o histórico atual de captura e invalida sweeps/cache dependentes.
+ *
+ * @return `ESP_OK` em caso de sucesso.
+ */
+esp_err_t adc_scope_clear_history(void);
 
 /**
  * @brief Reconfigura a frequência de amostragem por canal do ADC contínuo.

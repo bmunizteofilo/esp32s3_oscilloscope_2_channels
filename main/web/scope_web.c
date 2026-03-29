@@ -72,7 +72,7 @@ static const char *TAG = "scope_web";
 /** @brief Opção de base de tempo disponível na interface web. */
 typedef struct {
     const char *label;          /**< Texto visível no seletor web. */
-    uint32_t total_window_us;   /**< Janela total exibida em microssegundos. */
+    uint32_t time_per_div_us;   /**< Tempo representado por cada divisão vertical da grade. */
 } scope_web_timebase_t;
 
 /** @brief Opção de escala vertical disponível na interface web. */
@@ -108,16 +108,16 @@ typedef struct {
 
 /** @brief Opções de base de tempo disponíveis na interface web. */
 static const scope_web_timebase_t s_scope_web_timebases[] = {
-    {.label = "5 ms",   .total_window_us = 5000U},
-    {.label = "10 ms",  .total_window_us = 10000U},
-    {.label = "15 ms",  .total_window_us = 15000U},
-    {.label = "20 ms",  .total_window_us = 20000U},
-    {.label = "25 ms",  .total_window_us = 25000U},
-    {.label = "50 ms",  .total_window_us = 50000U},
-    {.label = "100 ms", .total_window_us = 100000U},
-    {.label = "250 ms", .total_window_us = 250000U},
-    {.label = "500 ms", .total_window_us = 500000U},
-    {.label = "1 s",    .total_window_us = 1000000U},
+    {.label = "5 ms",   .time_per_div_us = 5000U},
+    {.label = "10 ms",  .time_per_div_us = 10000U},
+    {.label = "15 ms",  .time_per_div_us = 15000U},
+    {.label = "20 ms",  .time_per_div_us = 20000U},
+    {.label = "25 ms",  .time_per_div_us = 25000U},
+    {.label = "50 ms",  .time_per_div_us = 50000U},
+    {.label = "100 ms", .time_per_div_us = 100000U},
+    {.label = "250 ms", .time_per_div_us = 250000U},
+    {.label = "500 ms", .time_per_div_us = 500000U},
+    {.label = "1 s",    .time_per_div_us = 1000000U},
 };
 
 /** @brief Opções de escala vertical disponíveis na interface web. */
@@ -655,7 +655,9 @@ static uint32_t scope_web_get_requested_samples_from_state(const scope_web_view_
     }
 
     (void)adc_scope_get_sample_freq_hz(&sample_freq_hz);
-    requested = ((uint64_t)sample_freq_hz * (uint64_t)s_scope_web_timebases[timebase_index].total_window_us) / 1000000ULL;
+    requested =
+        ((uint64_t)sample_freq_hz *
+         (uint64_t)(s_scope_web_timebases[timebase_index].time_per_div_us * 10U)) / 1000000ULL;
     if (requested == 0U) {
         requested = 1U;
     }
