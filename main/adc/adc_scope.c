@@ -14,6 +14,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -35,6 +36,10 @@ static const char *TAG = "adc_scope";
 /** @brief Estado interno do módulo de aquisição. */
 typedef struct {
     adc_scope_config_t config;                                 /**< Cópia local da configuração do usuário. */
+    size_t logical_channel_count;                              /**< Quantidade total de canais lógicos suportados pelo hardware. */
+    adc_channel_t logical_channels[ADC_SCOPE_MAX_CHANNELS];    /**< Mapa completo dos canais lógicos disponíveis. */
+    adc_atten_t logical_attenuations[ADC_SCOPE_MAX_CHANNELS];  /**< Atenuação completa dos canais lógicos disponíveis. */
+    size_t active_source_index[ADC_SCOPE_MAX_CHANNELS];        /**< Mapeia slots ativos para os canais lógicos originais. */
     adc_continuous_handle_t adc_handle;                        /**< Handle do driver contínuo do ADC. */
     adc_cali_handle_t cali_handle[ADC_SCOPE_MAX_CHANNELS];     /**< Handle de calibração por canal. */
     TaskHandle_t task_handle;                                  /**< Task que consome frames do ADC. */
@@ -44,10 +49,17 @@ typedef struct {
     int16_t *circular_mv_buffer[ADC_SCOPE_MAX_CHANNELS];       /**< Buffer circular de tensão em milivolts por canal. */
     int16_t *block_mv_buffer[ADC_SCOPE_MAX_CHANNELS];          /**< Buffer usado na captura em bloco por canal. */
     int16_t *pause_mv_buffer[ADC_SCOPE_MAX_CHANNELS];          /**< Cópia congelada do histórico para navegação em pause. */
+    int16_t *free_run_mv_buffer[ADC_SCOPE_MAX_CHANNELS];       /**< Buffer cru do bloco atual do modo livre. */
+    int32_t *free_run_history_points[ADC_SCOPE_MAX_CHANNELS];  /**< Histórico renderizado de blocos do modo livre. */
     size_t circular_head[ADC_SCOPE_MAX_CHANNELS];              /**< Próxima posição de escrita no buffer circular de cada canal. */
     size_t circular_count[ADC_SCOPE_MAX_CHANNELS];             /**< Quantidade válida de amostras no buffer circular de cada canal. */
     size_t block_count[ADC_SCOPE_MAX_CHANNELS];                /**< Quantidade válida de amostras no buffer em bloco de cada canal. */
     size_t pause_count;                                        /**< Quantidade compartilhada de amostras congeladas no snapshot de pause. */
+    size_t free_run_count[ADC_SCOPE_MAX_CHANNELS];             /**< Quantidade capturada do bloco livre atual por canal. */
+    size_t free_run_target;                                    /**< Tamanho desejado do bloco livre atual em amostras por canal. */
+    size_t free_run_overlap;                                   /**< Quantidade de amostras reaproveitadas entre blocos livres consecutivos. */
+    size_t free_run_history_head;                              /**< Próxima posição de escrita no histórico de blocos livres. */
+    size_t free_run_history_count;                             /**< Quantidade válida de blocos no histórico livre. */
     size_t block_target;                                       /**< Quantidade alvo da captura em bloco corrente. */
     adc_scope_mode_t mode;                                     /**< Modo de aquisição ativo. */
     bool initialized;                                          /**< Indica se o módulo já foi inicializado. */
@@ -64,6 +76,9 @@ typedef struct {
     uint64_t sample_sequence[ADC_SCOPE_MAX_CHANNELS];          /**< Sequência absoluta de amostras processadas por canal. */
     uint64_t pause_latest_sequence[ADC_SCOPE_MAX_CHANNELS];    /**< Última sequência correspondente ao snapshot congelado. */
     uint64_t continuity_start_sequence[ADC_SCOPE_MAX_CHANNELS];/**< Primeira sequência válida do trecho contínuo atual por canal. */
+    uint64_t rate_last_sequence;                               /**< Última sequência usada para estimar a taxa efetiva. */
+    int64_t rate_last_us;                                      /**< Último timestamp usado para estimar a taxa efetiva. */
+    uint32_t effective_sample_freq_hz;                         /**< Taxa efetiva estimada de amostragem por canal. */
     int32_t prev_mv[ADC_SCOPE_MAX_CHANNELS];                   /**< Última amostra por canal para detectar cruzamentos refinados. */
     bool prev_mv_valid[ADC_SCOPE_MAX_CHANNELS];                /**< Indica se prev_mv já foi inicializado por canal. */
     uint32_t discard_frames_remaining;                         /**< Quantidade de frames DMA ainda descartados após reset/reconfiguração. */
@@ -87,6 +102,7 @@ typedef struct {
     size_t trigger_anchor_trigger_point_index;                 /**< Posição horizontal usada na sweep âncora. */
     int32_t *trigger_cache_points[ADC_SCOPE_MAX_CHANNELS];     /**< Sweep triggerizada já renderizada por canal. */
     adc_scope_snapshot_t trigger_cache_snapshot;               /**< Snapshot associado à sweep em cache. */
+    adc_scope_snapshot_t free_run_history_snapshot[ADC_SCOPE_FREE_HISTORY_BLOCKS]; /**< Snapshots dos blocos livres renderizados. */
     bool trigger_cache_valid;                                  /**< Indica se existe uma sweep renderizada válida em cache. */
     uint64_t trigger_cache_seq;                                /**< Evento base usado na sweep em cache. */
     size_t trigger_cache_requested_samples;                    /**< Janela usada no cache. */
@@ -180,6 +196,14 @@ static size_t adc_scope_get_shared_contiguous_tail_count_locked(void)
 }
 
 /**
+ * @brief Armazena uma amostra no bloco corrente do modo livre.
+ *
+ * @param[in] channel_index Índice lógico do canal.
+ * @param[in] mv Amostra em milivolts.
+ */
+static void adc_scope_store_free_run_sample_locked(size_t channel_index, int32_t mv);
+
+/**
  * @brief Lê uma amostra relativa ao início lógico do histórico de um canal.
  *
  * @param[in] channel_index Índice lógico do canal.
@@ -212,35 +236,6 @@ static int32_t adc_scope_get_source_sample_locked(size_t channel_index,
  *
  * @return Amostra interpolada em milivolts.
  */
-static int32_t adc_scope_get_source_sample_interpolated_locked(size_t channel_index,
-                                                               bool circular_source,
-                                                               size_t oldest_start,
-                                                               uint64_t rel_index_fp,
-                                                               size_t available_count)
-{
-    if (available_count == 0U) {
-        return 0;
-    }
-
-    const size_t base_index = (size_t)(rel_index_fp / 1024ULL);
-    const uint32_t frac = (uint32_t)(rel_index_fp % 1024ULL);
-    const size_t clamped_base = (base_index < available_count) ? base_index : (available_count - 1U);
-    const int32_t sample_a =
-        adc_scope_get_source_sample_locked(channel_index, circular_source, oldest_start, clamped_base);
-
-    if (frac == 0U || (clamped_base + 1U) >= available_count) {
-        return sample_a;
-    }
-
-    const int32_t sample_b =
-        adc_scope_get_source_sample_locked(channel_index, circular_source, oldest_start, clamped_base + 1U);
-    const int64_t interp =
-        ((int64_t)sample_a * (int64_t)(1024U - frac)) +
-        ((int64_t)sample_b * (int64_t)frac);
-
-    return (int32_t)(interp / 1024LL);
-}
-
 /**
  * @brief Renderiza um buffer linear fechado para os pontos do gráfico.
  */
@@ -287,20 +282,9 @@ static void adc_scope_render_linear_buffer(const int16_t *source,
     }
 
     for (size_t i = 0; i < point_count; i++) {
-        const uint64_t scaled_pos =
-            ((uint64_t)i * (uint64_t)(sample_count - 1U) * 1024ULL) / (uint64_t)(point_count - 1U);
-        const size_t src_index = (size_t)(scaled_pos / 1024ULL);
-        const uint32_t frac = (uint32_t)(scaled_pos % 1024ULL);
-        const int32_t sample_a = (int32_t)source[src_index];
-        int32_t mv = sample_a;
-
-        if ((src_index + 1U) < sample_count && frac > 0U) {
-            const int32_t sample_b = (int32_t)source[src_index + 1U];
-            const int64_t interp =
-                ((int64_t)sample_a * (int64_t)(1024U - frac)) +
-                ((int64_t)sample_b * (int64_t)frac);
-            mv = (int32_t)(interp / 1024LL);
-        }
+        const size_t src_index =
+            (size_t)(((uint64_t)i * (uint64_t)(sample_count - 1U)) / (uint64_t)(point_count - 1U));
+        const int32_t mv = (int32_t)source[src_index];
 
         dest[i] = mv;
         if (mv < min_mv) {
@@ -347,7 +331,7 @@ static void adc_scope_measure_linear_buffer(const int16_t *source,
         *out_valid = false;
     }
 
-    if (source == NULL || sample_count < 3U || s_scope.config.sample_freq_hz == 0U) {
+    if (source == NULL || sample_count < 3U || s_scope.effective_sample_freq_hz == 0U) {
         return;
     }
 
@@ -385,7 +369,7 @@ static void adc_scope_measure_linear_buffer(const int16_t *source,
     }
 
     if (out_freq_tenths_hz != NULL) {
-        const uint64_t numerator = (uint64_t)s_scope.config.sample_freq_hz * 10ULL;
+        const uint64_t numerator = (uint64_t)s_scope.effective_sample_freq_hz * 10ULL;
         const uint64_t avg_period_samples =
             ((uint64_t)(last_edge - first_edge) + ((uint64_t)(matching_edges - 1U) / 2ULL)) /
             (uint64_t)(matching_edges - 1U);
@@ -460,6 +444,7 @@ static void adc_scope_render_window_locked(size_t channel_index,
                                            size_t oldest_start,
                                            size_t window_start,
                                            size_t window_len,
+                                           size_t full_window_len,
                                            uint64_t window_start_fp,
                                            int32_t *dest,
                                            size_t point_count,
@@ -494,7 +479,7 @@ static void adc_scope_render_window_locked(size_t channel_index,
         return;
     }
 
-    if (window_len == 1U) {
+    if (window_len == 1U || full_window_len <= 1U) {
         const int32_t mv = adc_scope_get_source_sample_locked(channel_index, circular_source, oldest_start, window_start);
         for (size_t i = 0; i < point_count; i++) {
             dest[i] = mv;
@@ -525,9 +510,15 @@ static void adc_scope_render_window_locked(size_t channel_index,
     }
 
     for (size_t i = 0; i < point_count; i++) {
-        const size_t sample_index =
-            window_start +
-            (size_t)(((uint64_t)i * (uint64_t)(window_len - 1U)) / (uint64_t)(point_count - 1U));
+        const size_t target_sample =
+            (size_t)(((uint64_t)i * (uint64_t)(full_window_len - 1U)) / (uint64_t)(point_count - 1U));
+
+        if (target_sample >= window_len) {
+            dest[i] = INT32_MAX;
+            continue;
+        }
+
+        const size_t sample_index = window_start + target_sample;
         const int32_t mv =
             adc_scope_get_source_sample_locked(channel_index,
                                                circular_source,
@@ -592,7 +583,7 @@ static void adc_scope_measure_window_locked(size_t channel_index,
         *out_valid = false;
     }
 
-    if (window_len < 3U || s_scope.config.sample_freq_hz == 0U) {
+    if (window_len < 3U || s_scope.effective_sample_freq_hz == 0U) {
         return;
     }
 
@@ -631,7 +622,7 @@ static void adc_scope_measure_window_locked(size_t channel_index,
     }
 
     if (out_freq_tenths_hz != NULL) {
-        const uint64_t numerator = (uint64_t)s_scope.config.sample_freq_hz * 10ULL;
+        const uint64_t numerator = (uint64_t)s_scope.effective_sample_freq_hz * 10ULL;
         const uint64_t avg_period_samples =
             ((uint64_t)(last_edge - first_edge) + ((uint64_t)(matching_edges - 1U) / 2ULL)) /
             (uint64_t)(matching_edges - 1U);
@@ -728,9 +719,11 @@ static void adc_scope_store_block_sample_locked(size_t channel_index, int32_t mv
 static int32_t adc_scope_convert_raw_to_mv(size_t channel_index, uint32_t raw)
 {
     int voltage_mv = (int)raw;
+    const size_t logical_index =
+        (channel_index < ADC_SCOPE_MAX_CHANNELS) ? s_scope.active_source_index[channel_index] : 0U;
 
-    if (s_scope.calibrated[channel_index]) {
-        if (adc_cali_raw_to_voltage(s_scope.cali_handle[channel_index], (int)raw, &voltage_mv) != ESP_OK) {
+    if (logical_index < ADC_SCOPE_MAX_CHANNELS && s_scope.calibrated[logical_index]) {
+        if (adc_cali_raw_to_voltage(s_scope.cali_handle[logical_index], (int)raw, &voltage_mv) != ESP_OK) {
             voltage_mv = (int)raw;
         }
     }
@@ -746,6 +739,8 @@ static int32_t adc_scope_convert_raw_to_mv(size_t channel_index, uint32_t raw)
  */
 static void adc_scope_process_samples(const uint8_t *data, uint32_t size)
 {
+    size_t processed_ref_samples = 0U;
+
     if (xSemaphoreTake(s_scope.mutex, portMAX_DELAY) != pdTRUE) {
         return;
     }
@@ -766,6 +761,9 @@ static void adc_scope_process_samples(const uint8_t *data, uint32_t size)
         s_scope.latest_raw[index] = raw;
         s_scope.latest_mv[index] = mv;
         s_scope.sample_sequence[index]++;
+        if (index == 0) {
+            processed_ref_samples++;
+        }
 
         if ((size_t)index == s_scope.trigger_monitor_channel_index &&
             s_scope.trigger_monitor_mode != ADC_SCOPE_TRIGGER_FREE) {
@@ -810,6 +808,8 @@ static void adc_scope_process_samples(const uint8_t *data, uint32_t size)
         } else {
             adc_scope_store_block_sample_locked((size_t)index, mv);
         }
+
+        adc_scope_store_free_run_sample_locked((size_t)index, mv);
 
         if (s_scope.mode == ADC_SCOPE_MODE_CIRCULAR &&
             (size_t)index == s_scope.trigger_monitor_channel_index &&
@@ -910,9 +910,139 @@ static void adc_scope_process_samples(const uint8_t *data, uint32_t size)
         }
     }
 
+    if (processed_ref_samples > 0U) {
+        const int64_t now_us = esp_timer_get_time();
+
+        if (s_scope.rate_last_us == 0) {
+            s_scope.rate_last_us = now_us;
+            s_scope.rate_last_sequence = s_scope.sample_sequence[0];
+            s_scope.effective_sample_freq_hz = s_scope.config.sample_freq_hz;
+        } else {
+            const int64_t delta_us = now_us - s_scope.rate_last_us;
+            const uint64_t delta_seq = s_scope.sample_sequence[0] - s_scope.rate_last_sequence;
+
+            if (delta_us >= 100000 && delta_seq > 0U) {
+                const uint32_t measured_hz =
+                    (uint32_t)(((delta_seq * 1000000ULL) + ((uint64_t)delta_us / 2ULL)) / (uint64_t)delta_us);
+
+                if (s_scope.effective_sample_freq_hz == 0U) {
+                    s_scope.effective_sample_freq_hz = measured_hz;
+                } else {
+                    s_scope.effective_sample_freq_hz =
+                        (uint32_t)((((uint64_t)s_scope.effective_sample_freq_hz * 3ULL) + (uint64_t)measured_hz + 2ULL) / 4ULL);
+                }
+
+                s_scope.rate_last_us = now_us;
+                s_scope.rate_last_sequence = s_scope.sample_sequence[0];
+            }
+        }
+    }
+
     xSemaphoreGive(s_scope.mutex);
 }
 
+static void adc_scope_store_free_run_sample_locked(size_t channel_index, int32_t mv)
+{
+    bool all_done = true;
+    size_t next_count = 0U;
+
+    if (s_scope.free_run_target == 0U) {
+        return;
+    }
+
+    if (mv > INT16_MAX) {
+        mv = INT16_MAX;
+    } else if (mv < INT16_MIN) {
+        mv = INT16_MIN;
+    }
+
+    if (s_scope.free_run_count[channel_index] < s_scope.free_run_target) {
+        s_scope.free_run_mv_buffer[channel_index][s_scope.free_run_count[channel_index]++] = (int16_t)mv;
+    }
+
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        if (s_scope.free_run_count[i] < s_scope.free_run_target) {
+            all_done = false;
+            break;
+        }
+    }
+
+    if (!all_done) {
+        return;
+    }
+
+    {
+        const size_t history_slot = s_scope.free_run_history_head;
+
+        for (size_t ch = 0; ch < s_scope.config.channel_count; ch++) {
+            int32_t *dest =
+                &s_scope.free_run_history_points[ch][history_slot * s_scope.config.chart_point_count];
+
+            adc_scope_render_linear_buffer(s_scope.free_run_mv_buffer[ch],
+                                           s_scope.free_run_target,
+                                           dest,
+                                           s_scope.config.chart_point_count,
+                                           &s_scope.free_run_history_snapshot[history_slot].min_mv[ch],
+                                           &s_scope.free_run_history_snapshot[history_slot].max_mv[ch]);
+
+            adc_scope_measure_linear_buffer(s_scope.free_run_mv_buffer[ch],
+                                            s_scope.free_run_target,
+                                            s_scope.trigger_monitor_level_mv,
+                                            &s_scope.free_run_history_snapshot[history_slot].frequency_tenths_hz[ch],
+                                            &s_scope.free_run_history_snapshot[history_slot].duty_tenths_percent[ch],
+                                            &s_scope.free_run_history_snapshot[history_slot].measurements_valid[ch]);
+
+            s_scope.free_run_history_snapshot[history_slot].latest_sequence[ch] = s_scope.sample_sequence[ch];
+            s_scope.free_run_history_snapshot[history_slot].latest_raw[ch] = s_scope.latest_raw[ch];
+            s_scope.free_run_history_snapshot[history_slot].latest_mv[ch] = s_scope.latest_mv[ch];
+            s_scope.free_run_history_snapshot[history_slot].calibrated[ch] = s_scope.calibrated[ch];
+            s_scope.free_run_history_snapshot[history_slot].window_start_fp_q10[ch] =
+                (s_scope.sample_sequence[ch] >= s_scope.free_run_target) ?
+                    ((s_scope.sample_sequence[ch] - (s_scope.free_run_target - 1U)) * 1024ULL) :
+                    0U;
+        }
+
+        s_scope.free_run_history_snapshot[history_slot].mode = ADC_SCOPE_MODE_BLOCK;
+        s_scope.free_run_history_snapshot[history_slot].channel_count = s_scope.config.channel_count;
+        s_scope.free_run_history_snapshot[history_slot].sample_count = s_scope.free_run_target;
+        s_scope.free_run_history_snapshot[history_slot].capacity = s_scope.config.chart_point_count;
+        s_scope.free_run_history_snapshot[history_slot].history_capacity = ADC_SCOPE_FREE_HISTORY_BLOCKS;
+        s_scope.free_run_history_snapshot[history_slot].history_count =
+            (s_scope.free_run_history_count < ADC_SCOPE_FREE_HISTORY_BLOCKS) ?
+                (s_scope.free_run_history_count + 1U) : ADC_SCOPE_FREE_HISTORY_BLOCKS;
+        s_scope.free_run_history_snapshot[history_slot].capture_ready = true;
+        s_scope.free_run_history_snapshot[history_slot].acquisition_running = s_scope.started;
+        s_scope.free_run_history_snapshot[history_slot].trigger_found = false;
+        s_scope.free_run_history_snapshot[history_slot].overflow_seen = s_scope.overflow_seen;
+        s_scope.free_run_history_snapshot[history_slot].trigger_channel_index = s_scope.trigger_monitor_channel_index;
+        s_scope.free_run_history_snapshot[history_slot].trigger_level_mv = s_scope.trigger_monitor_level_mv;
+        s_scope.free_run_history_snapshot[history_slot].trigger_hysteresis_mv = s_scope.trigger_monitor_hysteresis_mv;
+        s_scope.free_run_history_snapshot[history_slot].trigger_sample_index = 0U;
+
+        s_scope.free_run_history_head = (s_scope.free_run_history_head + 1U) % ADC_SCOPE_FREE_HISTORY_BLOCKS;
+        if (s_scope.free_run_history_count < ADC_SCOPE_FREE_HISTORY_BLOCKS) {
+            s_scope.free_run_history_count++;
+        }
+    }
+
+    next_count = s_scope.free_run_overlap;
+    if (next_count >= s_scope.free_run_target) {
+        next_count = (s_scope.free_run_target > 0U) ? (s_scope.free_run_target - 1U) : 0U;
+    }
+
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        if (next_count > 0U) {
+            memmove(s_scope.free_run_mv_buffer[i],
+                    &s_scope.free_run_mv_buffer[i][s_scope.free_run_target - next_count],
+                    next_count * sizeof(int16_t));
+        }
+        s_scope.free_run_count[i] = next_count;
+    }
+}
+
+/**
+ * @brief Renderiza um buffer linear parcial mantendo a escala temporal de uma janela cheia.
+ */
 /**
  * @brief Callback disparada quando um frame DMA de conversões fica pronto.
  *
@@ -1065,6 +1195,12 @@ esp_err_t adc_scope_init(const adc_scope_config_t *config)
     }
 
     s_scope.config = *config;
+    s_scope.logical_channel_count = config->channel_count;
+    memcpy(s_scope.logical_channels, config->channels, sizeof(s_scope.logical_channels));
+    memcpy(s_scope.logical_attenuations, config->attenuations, sizeof(s_scope.logical_attenuations));
+    for (size_t i = 0; i < ADC_SCOPE_MAX_CHANNELS; i++) {
+        s_scope.active_source_index[i] = i;
+    }
     s_scope.mode = ADC_SCOPE_MODE_CIRCULAR;
     s_scope.block_target = config->default_block_sample_count;
 
@@ -1080,14 +1216,24 @@ esp_err_t adc_scope_init(const adc_scope_config_t *config)
         s_scope.circular_mv_buffer[i] = calloc(config->circular_buffer_capacity, sizeof(int16_t));
         s_scope.block_mv_buffer[i] = calloc(config->chart_point_count, sizeof(int16_t));
         s_scope.pause_mv_buffer[i] = calloc(config->circular_buffer_capacity, sizeof(int16_t));
+        s_scope.free_run_mv_buffer[i] = calloc(config->circular_buffer_capacity, sizeof(int16_t));
         s_scope.trigger_cache_points[i] = calloc(config->chart_point_count, sizeof(int32_t));
         s_scope.trigger_sweep_mv_buffer[i] = calloc(config->circular_buffer_capacity, sizeof(int16_t));
+        s_scope.free_run_history_points[i] =
+            calloc(ADC_SCOPE_FREE_HISTORY_BLOCKS * config->chart_point_count, sizeof(int32_t));
         ESP_GOTO_ON_FALSE(s_scope.circular_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar buffer circular");
         ESP_GOTO_ON_FALSE(s_scope.block_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar buffer bloco");
         ESP_GOTO_ON_FALSE(s_scope.pause_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar buffer de pause");
+        ESP_GOTO_ON_FALSE(s_scope.free_run_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar buffer livre");
         ESP_GOTO_ON_FALSE(s_scope.trigger_cache_points[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar cache de trigger");
         ESP_GOTO_ON_FALSE(s_scope.trigger_sweep_mv_buffer[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar sweep de trigger");
+        ESP_GOTO_ON_FALSE(s_scope.free_run_history_points[i] != NULL, ESP_ERR_NO_MEM, err, TAG, "falha ao alocar historico livre");
     }
+
+    s_scope.free_run_target = config->default_block_sample_count;
+    s_scope.free_run_overlap = (config->default_block_sample_count > 1U) ?
+                                   (config->default_block_sample_count / 2U) :
+                                   0U;
 
     handle_config.max_store_buf_size = config->max_store_buf_size;
     handle_config.conv_frame_size = config->conv_frame_size;
@@ -1144,6 +1290,7 @@ esp_err_t adc_scope_init(const adc_scope_config_t *config)
     ESP_GOTO_ON_FALSE(task_ok == pdPASS, ESP_ERR_NO_MEM, err, TAG, "falha ao criar task ADC");
 
     s_scope.initialized = true;
+    s_scope.effective_sample_freq_hz = config->sample_freq_hz;
     ESP_LOGI(TAG,
              "ADC pronto: CH1 GPIO %d, CH2 GPIO %d, freq=%" PRIu32 " Hz/canal, pontos=%u",
              s_scope.gpio_num[0],
@@ -1182,9 +1329,17 @@ err:
             free(s_scope.pause_mv_buffer[i]);
             s_scope.pause_mv_buffer[i] = NULL;
         }
+        if (s_scope.free_run_mv_buffer[i] != NULL) {
+            free(s_scope.free_run_mv_buffer[i]);
+            s_scope.free_run_mv_buffer[i] = NULL;
+        }
         if (s_scope.circular_mv_buffer[i] != NULL) {
             free(s_scope.circular_mv_buffer[i]);
             s_scope.circular_mv_buffer[i] = NULL;
+        }
+        if (s_scope.free_run_history_points[i] != NULL) {
+            free(s_scope.free_run_history_points[i]);
+            s_scope.free_run_history_points[i] = NULL;
         }
     }
     if (s_scope.read_buffer != NULL) {
@@ -1359,7 +1514,6 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
     size_t count = 0U;
     size_t window_start = 0U;
     size_t window_len = 0U;
-    size_t render_point_count = 0U;
     uint64_t window_start_fp = 0U;
     bool circular_source = false;
     bool trigger_cache_compatible = false;
@@ -1526,22 +1680,6 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
     window_len = (requested_samples < count) ? requested_samples : count;
     window_start = (count > window_len) ? (count - window_len) : 0U;
     window_start_fp = (uint64_t)window_start * 1024ULL;
-    render_point_count = point_count;
-
-    if (trigger_mode == ADC_SCOPE_TRIGGER_FREE &&
-        history_offset_samples == 0U &&
-        requested_samples > 0U &&
-        window_len > 0U &&
-        window_len < requested_samples) {
-        render_point_count = (size_t)((((uint64_t)window_len * (uint64_t)point_count) + (uint64_t)requested_samples - 1ULL) /
-                                      (uint64_t)requested_samples);
-        if (render_point_count == 0U) {
-            render_point_count = 1U;
-        } else if (render_point_count > point_count) {
-            render_point_count = point_count;
-        }
-    }
-
     snapshot.trigger_level_mv = (trigger_level_mv == INT32_MIN) ? 0 : trigger_level_mv;
     snapshot.trigger_hysteresis_mv = trigger_hysteresis_mv;
 
@@ -1610,16 +1748,19 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
             }
         }
 
-        adc_scope_render_window_locked(i,
-                                       circular_source,
-                                       oldest_start[i],
-                                       source_window_start[i],
-                                       window_len,
-                                       (uint64_t)source_window_start[i] * 1024ULL,
-                                       dest_per_channel[i],
-                                       render_point_count,
-                                       &snapshot.min_mv[i],
-                                       &snapshot.max_mv[i]);
+        if (dest_per_channel[i] != NULL) {
+            adc_scope_render_window_locked(i,
+                                           circular_source,
+                                           oldest_start[i],
+                                           source_window_start[i],
+                                           window_len,
+                                           requested_samples,
+                                           (uint64_t)source_window_start[i] * 1024ULL,
+                                           dest_per_channel[i],
+                                           point_count,
+                                           &snapshot.min_mv[i],
+                                           &snapshot.max_mv[i]);
+        }
 
         adc_scope_measure_window_locked(i,
                                         circular_source,
@@ -1730,6 +1871,205 @@ esp_err_t adc_scope_get_sample_freq_hz(uint32_t *out_sample_freq_hz)
     return ESP_OK;
 }
 
+esp_err_t adc_scope_get_effective_sample_freq_hz(uint32_t *out_sample_freq_hz)
+{
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+    ESP_RETURN_ON_FALSE(out_sample_freq_hz != NULL, ESP_ERR_INVALID_ARG, TAG, "saida nula");
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    *out_sample_freq_hz =
+        (s_scope.effective_sample_freq_hz > 0U) ? s_scope.effective_sample_freq_hz : s_scope.config.sample_freq_hz;
+
+    xSemaphoreGive(s_scope.mutex);
+    return ESP_OK;
+}
+
+esp_err_t adc_scope_get_circular_status(size_t channel_index,
+                                        uint64_t *out_latest_sequence,
+                                        size_t *out_shared_history_count)
+{
+    size_t shared_count = 0U;
+
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+    ESP_RETURN_ON_FALSE(channel_index < s_scope.config.channel_count, ESP_ERR_INVALID_ARG, TAG, "channel_index invalido");
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    shared_count = adc_scope_get_shared_count_locked(true);
+    {
+        const size_t contiguous_count = adc_scope_get_shared_contiguous_tail_count_locked();
+        if (contiguous_count < shared_count) {
+            shared_count = contiguous_count;
+        }
+    }
+
+    if (out_latest_sequence != NULL) {
+        *out_latest_sequence = s_scope.sample_sequence[channel_index];
+    }
+    if (out_shared_history_count != NULL) {
+        *out_shared_history_count = shared_count;
+    }
+
+    xSemaphoreGive(s_scope.mutex);
+    return ESP_OK;
+}
+
+esp_err_t adc_scope_copy_free_run_circular_window_multi(int32_t *dest_per_channel[ADC_SCOPE_MAX_CHANNELS],
+                                                        size_t point_count,
+                                                        size_t requested_samples,
+                                                        uint64_t display_end_sequence,
+                                                        int32_t trigger_level_mv,
+                                                        adc_scope_snapshot_t *out_snapshot)
+{
+    adc_scope_snapshot_t snapshot = {0};
+    size_t oldest_start[ADC_SCOPE_MAX_CHANNELS] = {0};
+    size_t source_window_start[ADC_SCOPE_MAX_CHANNELS] = {0};
+    size_t shared_count = 0U;
+    size_t window_len = 0U;
+    uint64_t shared_oldest_sequence = 0U;
+    uint64_t shared_newest_sequence = 0U;
+    bool shared_sequence_valid = false;
+
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+    ESP_RETURN_ON_FALSE(dest_per_channel != NULL, ESP_ERR_INVALID_ARG, TAG, "destinos nulos");
+    ESP_RETURN_ON_FALSE(point_count == s_scope.config.chart_point_count, ESP_ERR_INVALID_ARG, TAG, "point_count divergente");
+    ESP_RETURN_ON_FALSE(requested_samples > 0U, ESP_ERR_INVALID_ARG, TAG, "requested_samples invalido");
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    snapshot.mode = ADC_SCOPE_MODE_CIRCULAR;
+    snapshot.channel_count = s_scope.config.channel_count;
+    snapshot.capacity = point_count;
+    snapshot.history_capacity = s_scope.config.circular_buffer_capacity;
+    snapshot.capture_ready = s_scope.block_capture_ready;
+    snapshot.acquisition_running = s_scope.started;
+    snapshot.trigger_found = false;
+    snapshot.overflow_seen = s_scope.overflow_seen;
+    snapshot.trigger_channel_index = s_scope.trigger_monitor_channel_index;
+    snapshot.trigger_level_mv = (trigger_level_mv == INT32_MIN) ? 0 : trigger_level_mv;
+    snapshot.trigger_hysteresis_mv = 0U;
+
+    shared_count = adc_scope_get_shared_count_locked(true);
+    {
+        const size_t contiguous_count = adc_scope_get_shared_contiguous_tail_count_locked();
+        if (contiguous_count < shared_count) {
+            shared_count = contiguous_count;
+        }
+    }
+    snapshot.history_count = shared_count;
+
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        snapshot.latest_sequence[i] = s_scope.sample_sequence[i];
+        snapshot.latest_raw[i] = s_scope.latest_raw[i];
+        snapshot.latest_mv[i] = s_scope.latest_mv[i];
+        snapshot.calibrated[i] = s_scope.calibrated[i];
+        snapshot.window_start_fp_q10[i] = 0U;
+        snapshot.min_mv[i] = 0;
+        snapshot.max_mv[i] = 0;
+        snapshot.frequency_tenths_hz[i] = 0U;
+        snapshot.duty_tenths_percent[i] = 0U;
+        snapshot.measurements_valid[i] = false;
+        oldest_start[i] =
+            (s_scope.circular_head[i] + s_scope.config.circular_buffer_capacity - s_scope.circular_count[i]) %
+            s_scope.config.circular_buffer_capacity;
+
+        if (s_scope.circular_count[i] > 0U) {
+            const uint64_t channel_oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
+            const uint64_t channel_newest_sequence = s_scope.sample_sequence[i];
+
+            if (!shared_sequence_valid) {
+                shared_oldest_sequence = channel_oldest_sequence;
+                shared_newest_sequence = channel_newest_sequence;
+                shared_sequence_valid = true;
+            } else {
+                if (channel_oldest_sequence > shared_oldest_sequence) {
+                    shared_oldest_sequence = channel_oldest_sequence;
+                }
+                if (channel_newest_sequence < shared_newest_sequence) {
+                    shared_newest_sequence = channel_newest_sequence;
+                }
+            }
+        }
+    }
+
+    if (!shared_sequence_valid || shared_count == 0U) {
+        xSemaphoreGive(s_scope.mutex);
+        if (out_snapshot != NULL) {
+            *out_snapshot = snapshot;
+        }
+        return ESP_OK;
+    }
+
+    if (display_end_sequence > shared_newest_sequence) {
+        display_end_sequence = shared_newest_sequence;
+    }
+    if (display_end_sequence < shared_oldest_sequence) {
+        display_end_sequence = shared_oldest_sequence;
+    }
+
+    if (display_end_sequence >= shared_oldest_sequence) {
+        window_len = (size_t)(display_end_sequence - shared_oldest_sequence + 1ULL);
+    }
+    if (window_len > requested_samples) {
+        window_len = requested_samples;
+    }
+    snapshot.sample_count = window_len;
+
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        const uint64_t channel_oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
+        const uint64_t window_start_sequence =
+            (display_end_sequence + 1ULL >= (uint64_t)window_len) ?
+                (display_end_sequence - (window_len - 1U)) :
+                0U;
+
+        source_window_start[i] = (size_t)(window_start_sequence - channel_oldest_sequence);
+        snapshot.window_start_fp_q10[i] = window_start_sequence * 1024ULL;
+
+        if (dest_per_channel[i] != NULL) {
+            for (size_t j = 0; j < point_count; j++) {
+                dest_per_channel[i][j] = INT32_MAX;
+            }
+
+            adc_scope_render_window_locked(i,
+                                           true,
+                                           oldest_start[i],
+                                           source_window_start[i],
+                                           window_len,
+                                           requested_samples,
+                                           (uint64_t)source_window_start[i] * 1024ULL,
+                                           dest_per_channel[i],
+                                           point_count,
+                                           &snapshot.min_mv[i],
+                                           &snapshot.max_mv[i]);
+        }
+
+        adc_scope_measure_window_locked(i,
+                                        true,
+                                        oldest_start[i],
+                                        source_window_start[i],
+                                        window_len,
+                                        snapshot.trigger_level_mv,
+                                        &snapshot.frequency_tenths_hz[i],
+                                        &snapshot.duty_tenths_percent[i],
+                                        &snapshot.measurements_valid[i]);
+    }
+
+    xSemaphoreGive(s_scope.mutex);
+
+    if (out_snapshot != NULL) {
+        *out_snapshot = snapshot;
+    }
+
+    return ESP_OK;
+}
+
 /**
  * @brief Limpa o histórico atual de captura e invalida caches dependentes.
  *
@@ -1751,6 +2091,7 @@ esp_err_t adc_scope_clear_history(void)
         s_scope.circular_head[i] = 0U;
         s_scope.circular_count[i] = 0U;
         s_scope.block_count[i] = 0U;
+        s_scope.free_run_count[i] = 0U;
         s_scope.sample_sequence[i] = 0U;
         s_scope.pause_latest_sequence[i] = 0U;
         s_scope.continuity_start_sequence[i] = 1U;
@@ -1758,10 +2099,16 @@ esp_err_t adc_scope_clear_history(void)
         s_scope.latest_mv[i] = 0U;
         s_scope.prev_mv_valid[i] = false;
     }
+    s_scope.rate_last_sequence = 0U;
+    s_scope.rate_last_us = 0;
+    s_scope.effective_sample_freq_hz = s_scope.config.sample_freq_hz;
 
     s_scope.block_capture_ready = false;
     s_scope.pause_count = 0U;
     s_scope.pause_snapshot_valid = false;
+    s_scope.free_run_overlap = (s_scope.free_run_target > 1U) ? (s_scope.free_run_target / 2U) : 0U;
+    s_scope.free_run_history_head = 0U;
+    s_scope.free_run_history_count = 0U;
     s_scope.trigger_cache_valid = false;
     s_scope.discard_frames_remaining = 4U;
     adc_scope_reset_trigger_events_locked();
@@ -1829,6 +2176,90 @@ esp_err_t adc_scope_release_history_snapshot(void)
     return ESP_OK;
 }
 
+esp_err_t adc_scope_configure_free_run_block(size_t sample_count)
+{
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+
+    if (sample_count == 0U) {
+        sample_count = s_scope.config.default_block_sample_count;
+    }
+    ESP_RETURN_ON_FALSE(sample_count <= s_scope.config.circular_buffer_capacity, ESP_ERR_INVALID_ARG, TAG, "sample_count excede buffer livre");
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    s_scope.free_run_target = sample_count;
+    s_scope.free_run_overlap = (sample_count > 1U) ? (sample_count / 2U) : 0U;
+    s_scope.free_run_history_head = 0U;
+    s_scope.free_run_history_count = 0U;
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        s_scope.free_run_count[i] = 0U;
+    }
+
+    xSemaphoreGive(s_scope.mutex);
+    return ESP_OK;
+}
+
+esp_err_t adc_scope_get_free_run_block(int32_t *dest_per_channel[ADC_SCOPE_MAX_CHANNELS],
+                                       size_t point_count,
+                                       size_t history_block_offset,
+                                       adc_scope_snapshot_t *out_snapshot,
+                                       bool *out_available)
+{
+    adc_scope_snapshot_t snapshot = {0};
+    size_t history_index = 0U;
+
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+    ESP_RETURN_ON_FALSE(dest_per_channel != NULL, ESP_ERR_INVALID_ARG, TAG, "destinos nulos");
+    ESP_RETURN_ON_FALSE(point_count == s_scope.config.chart_point_count, ESP_ERR_INVALID_ARG, TAG, "point_count divergente");
+
+    if (out_available != NULL) {
+        *out_available = false;
+    }
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (history_block_offset >= s_scope.free_run_history_count) {
+        xSemaphoreGive(s_scope.mutex);
+        if (out_snapshot != NULL) {
+            *out_snapshot = snapshot;
+        }
+        return ESP_OK;
+    }
+
+    history_index =
+        (s_scope.free_run_history_head + ADC_SCOPE_FREE_HISTORY_BLOCKS - 1U - history_block_offset) %
+        ADC_SCOPE_FREE_HISTORY_BLOCKS;
+
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        if (dest_per_channel[i] != NULL) {
+            memcpy(dest_per_channel[i],
+                   &s_scope.free_run_history_points[i][history_index * s_scope.config.chart_point_count],
+                   point_count * sizeof(int32_t));
+        }
+    }
+
+    snapshot = s_scope.free_run_history_snapshot[history_index];
+    snapshot.history_count = s_scope.free_run_history_count;
+    snapshot.history_capacity = ADC_SCOPE_FREE_HISTORY_BLOCKS;
+    snapshot.acquisition_running = s_scope.started;
+    snapshot.overflow_seen = s_scope.overflow_seen;
+
+    xSemaphoreGive(s_scope.mutex);
+
+    if (out_available != NULL) {
+        *out_available = true;
+    }
+    if (out_snapshot != NULL) {
+        *out_snapshot = snapshot;
+    }
+
+    return ESP_OK;
+}
+
 /**
  * @brief Reconfigura a frequência de amostragem por canal do ADC contínuo.
  *
@@ -1876,6 +2307,9 @@ esp_err_t adc_scope_set_sample_freq_hz(uint32_t sample_freq_hz)
     }
 
     s_scope.config.sample_freq_hz = sample_freq_hz;
+    s_scope.effective_sample_freq_hz = sample_freq_hz;
+    s_scope.rate_last_sequence = 0U;
+    s_scope.rate_last_us = 0;
     s_scope.trigger_holdoff_samples = s_scope.config.sample_freq_hz / 2000U;
     if (s_scope.trigger_holdoff_samples < 4U) {
         s_scope.trigger_holdoff_samples = 4U;
@@ -1895,6 +2329,121 @@ esp_err_t adc_scope_set_sample_freq_hz(uint32_t sample_freq_hz)
     }
 
     ESP_LOGI(TAG, "ADC reconfigurado para %" PRIu32 " Hz/canal", sample_freq_hz);
+    return ESP_OK;
+}
+
+esp_err_t adc_scope_set_active_channel_mode(uint16_t sample_channel_mode)
+{
+    adc_continuous_config_t adc_config = {0};
+    adc_digi_pattern_config_t patterns[ADC_SCOPE_MAX_CHANNELS] = {0};
+    size_t desired_count = 0U;
+    size_t desired_sources[ADC_SCOPE_MAX_CHANNELS] = {0U, 1U};
+    bool same_config = false;
+    bool was_started = false;
+
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+    ESP_RETURN_ON_FALSE(sample_channel_mode <= 2U, ESP_ERR_INVALID_ARG, TAG, "sample_channel_mode invalido");
+
+    if (sample_channel_mode == 2U) {
+        desired_count = 2U;
+        desired_sources[0] = 0U;
+        desired_sources[1] = 1U;
+    } else {
+        desired_count = 1U;
+        desired_sources[0] = (sample_channel_mode == 1U) ? 1U : 0U;
+    }
+
+    same_config = (desired_count == s_scope.config.channel_count);
+    if (same_config) {
+        for (size_t i = 0; i < desired_count; i++) {
+            if (s_scope.active_source_index[i] != desired_sources[i]) {
+                same_config = false;
+                break;
+            }
+        }
+    }
+    if (same_config) {
+        return ESP_OK;
+    }
+
+    was_started = s_scope.started;
+    if (was_started) {
+        ESP_RETURN_ON_ERROR(adc_scope_stop(), TAG, "falha ao interromper ADC para reconfigurar canais");
+    }
+
+    for (size_t i = 0; i < desired_count; i++) {
+        const size_t source_index = desired_sources[i];
+        patterns[i].atten = (uint8_t)s_scope.logical_attenuations[source_index];
+        patterns[i].channel = (uint8_t)s_scope.logical_channels[source_index];
+        patterns[i].unit = (uint8_t)s_scope.config.unit;
+        patterns[i].bit_width = (uint8_t)s_scope.config.bitwidth;
+    }
+
+    adc_config.pattern_num = desired_count;
+    adc_config.adc_pattern = patterns;
+    adc_config.sample_freq_hz = s_scope.config.sample_freq_hz * (uint32_t)desired_count;
+    adc_config.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+    adc_config.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+    ESP_RETURN_ON_ERROR(adc_continuous_config(s_scope.adc_handle, &adc_config), TAG, "falha ao reconfigurar canais do ADC continuo");
+    if (adc_continuous_flush_pool(s_scope.adc_handle) != ESP_OK) {
+        ESP_LOGW(TAG, "falha ao limpar pool interno do ADC apos reconfigurar canais");
+    }
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    s_scope.config.channel_count = desired_count;
+    for (size_t i = 0; i < desired_count; i++) {
+        const size_t source_index = desired_sources[i];
+        s_scope.active_source_index[i] = source_index;
+        s_scope.config.channels[i] = s_scope.logical_channels[source_index];
+        s_scope.config.attenuations[i] = s_scope.logical_attenuations[source_index];
+        s_scope.prev_mv_valid[i] = false;
+        s_scope.latest_raw[i] = 0U;
+        s_scope.latest_mv[i] = 0U;
+        s_scope.sample_sequence[i] = 0U;
+        s_scope.continuity_start_sequence[i] = 1U;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            adc_continuous_channel_to_io(s_scope.config.unit, s_scope.config.channels[i], &s_scope.gpio_num[i]));
+    }
+    for (size_t i = desired_count; i < ADC_SCOPE_MAX_CHANNELS; i++) {
+        s_scope.active_source_index[i] = i;
+        s_scope.prev_mv_valid[i] = false;
+        s_scope.latest_raw[i] = 0U;
+        s_scope.latest_mv[i] = 0U;
+        s_scope.sample_sequence[i] = 0U;
+        s_scope.continuity_start_sequence[i] = 1U;
+        s_scope.circular_head[i] = 0U;
+        s_scope.circular_count[i] = 0U;
+        s_scope.block_count[i] = 0U;
+        s_scope.free_run_count[i] = 0U;
+        s_scope.pause_latest_sequence[i] = 0U;
+        s_scope.gpio_num[i] = -1;
+    }
+    s_scope.pause_count = 0U;
+    s_scope.pause_snapshot_valid = false;
+    s_scope.block_capture_ready = false;
+    s_scope.free_run_history_head = 0U;
+    s_scope.free_run_history_count = 0U;
+    s_scope.trigger_monitor_channel_index = 0U;
+    s_scope.trigger_cache_valid = false;
+    s_scope.trigger_sweep_valid = false;
+    s_scope.trigger_sweep_pending = false;
+    s_scope.trigger_detector_zone = 0;
+    s_scope.trigger_last_event_seq = 0U;
+    s_scope.discard_frames_remaining = 4U;
+    s_scope.rate_last_sequence = 0U;
+    s_scope.rate_last_us = 0;
+    adc_scope_reset_trigger_events_locked();
+
+    xSemaphoreGive(s_scope.mutex);
+
+    if (was_started) {
+        ESP_RETURN_ON_ERROR(adc_scope_start(), TAG, "falha ao reiniciar ADC apos reconfigurar canais");
+    }
+
+    ESP_LOGI(TAG, "ADC reconfigurado para %u canal(is) ativo(s)", (unsigned)desired_count);
     return ESP_OK;
 }
 

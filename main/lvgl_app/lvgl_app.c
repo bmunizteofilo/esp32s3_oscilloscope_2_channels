@@ -125,6 +125,8 @@ typedef struct {
 
 /** @brief Opções de base de tempo disponíveis no seletor. */
 static const lvgl_scope_timebase_t s_timebase_options[] = {
+    {.label = "1 ms",   .time_per_div_us = 1000U},
+    {.label = "2 ms",   .time_per_div_us = 2000U},
     {.label = "5 ms",   .time_per_div_us = 5000U},
     {.label = "10 ms",  .time_per_div_us = 10000U},
     {.label = "15 ms",  .time_per_div_us = 15000U},
@@ -136,6 +138,46 @@ static const lvgl_scope_timebase_t s_timebase_options[] = {
     {.label = "500 ms", .time_per_div_us = 500000U},
     {.label = "1 s",    .time_per_div_us = 1000000U},
 };
+
+/** @brief Opções do dropdown de base de tempo quando apenas um canal está ativo. */
+static const char *s_timebase_dropdown_options_single =
+    "1 ms\n"
+    "2 ms\n"
+    "5 ms\n"
+    "10 ms\n"
+    "15 ms\n"
+    "20 ms\n"
+    "25 ms\n"
+    "50 ms\n"
+    "100 ms\n"
+    "250 ms\n"
+    "500 ms\n"
+    "1 s";
+
+/** @brief Opções do dropdown de base de tempo quando ambos os canais estão ativos. */
+static const char *s_timebase_dropdown_options_dual =
+    "2 ms\n"
+    "5 ms\n"
+    "10 ms\n"
+    "15 ms\n"
+    "20 ms\n"
+    "25 ms\n"
+    "50 ms\n"
+    "100 ms\n"
+    "250 ms\n"
+    "500 ms\n"
+    "1 s";
+
+/** @brief Opções do dropdown de canal de trigger com apenas o Ch1 ativo. */
+static const char *s_trigger_channel_dropdown_options_ch1 = "Ch 1";
+
+/** @brief Opções do dropdown de canal de trigger com apenas o Ch2 ativo. */
+static const char *s_trigger_channel_dropdown_options_ch2 = "Ch 2";
+
+/** @brief Opções do dropdown de canal de trigger com ambos os canais ativos. */
+static const char *s_trigger_channel_dropdown_options_dual =
+    "Ch 1\n"
+    "Ch 2";
 
 /** @brief Opções de escala vertical disponíveis no seletor. */
 static const lvgl_scope_voltscale_t s_voltscale_options[] = {
@@ -231,7 +273,7 @@ static SemaphoreHandle_t s_control_state_mutex = NULL;
 /** @brief Último estado compartilhado publicado pela UI local. */
 static lvgl_app_control_state_t s_shared_control_state = {
     .sample_channel_mode = 0U,
-    .timebase_index = 1U,
+    .timebase_index = 3U,
     .voltscale_index = 5U,
     .trigger_channel_index = 0U,
     .trigger_mode = (uint16_t)ADC_SCOPE_TRIGGER_RISE,
@@ -327,7 +369,7 @@ static int32_t s_chart_points_pending_ch2[APP_ADC_CHART_POINTS] = {0};
 static adc_scope_snapshot_t s_scope_snapshot = {0};
 
 /** @brief Índice atual da base de tempo selecionada. */
-static uint16_t s_timebase_index = 1U;
+static uint16_t s_timebase_index = 3U;
 
 /** @brief Índice atual da escala vertical selecionada. */
 static uint16_t s_voltscale_index = 5U;
@@ -371,6 +413,9 @@ static bool s_scope_paused = false;
 /** @brief Offset temporal aplicado à janela durante a pausa. */
 static size_t s_history_offset_samples = 0U;
 
+/** @brief Offset aplicado ao histórico de blocos do modo livre durante a pausa. */
+static size_t s_history_block_offset = 0U;
+
 /** @brief Indica se o efeito visual de varredura contínua está ativo no modo livre. */
 static bool s_free_run_sweep_active = false;
 
@@ -391,6 +436,9 @@ static uint64_t s_free_run_scroll_accum_fp = 0U;
 
 /** @brief Último início absoluto da janela livre já publicada, em amostras Q10. */
 static uint64_t s_free_run_last_window_start_fp = 0U;
+
+/** @brief Última sequência absoluta usada como fim da janela exibida no free-run circular. */
+static uint64_t s_free_run_display_end_sequence = 0U;
 
 /** @brief Quantidade de refreshes a manter a última tela congelada após retomar a captura. */
 static uint8_t s_capture_resume_settle_refreshes = 0U;
@@ -413,11 +461,17 @@ static int16_t s_drag_start_x = 0;
 /** @brief Offset temporal no início do último arraste. */
 static size_t s_drag_start_offset_samples = 0U;
 
+/** @brief Offset de bloco no início do último arraste em pause/free-run. */
+static size_t s_drag_start_block_offset = 0U;
+
 /** @brief Última posição Y registrada ao iniciar ajuste vertical do trigger. */
 static int16_t s_drag_start_y = 0;
 
 /** @brief Nível de trigger no início do último arraste vertical. */
 static int32_t s_drag_start_trigger_level_mv = 1650;
+
+/** @brief Indica se o pause atual está navegando o histórico de blocos do modo livre. */
+static bool s_pause_uses_block_history = false;
 
 /** @brief Nível atual do trigger em milivolts. */
 static int32_t s_trigger_level_mv = 1650;
@@ -449,6 +503,13 @@ static uint32_t lvgl_get_total_window_us_for_index(uint16_t timebase_index);
  * @return Janela total em microssegundos.
  */
 static uint32_t lvgl_get_selected_total_window_us(void);
+
+/**
+ * @brief Calcula quantas amostras recentes devem ser exibidas no gráfico.
+ *
+ * @return Quantidade de amostras desejadas para a janela atual.
+ */
+static size_t lvgl_get_requested_window_samples(void);
 
 /**
  * @brief Configura um overlay do chart para não interceptar gestos do usuário.
@@ -564,6 +625,10 @@ static void lvgl_hold_trigger_visual(uint32_t hold_ms)
  * @param[in] timer Timer do LVGL que disparou a atualização.
  */
 static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer);
+static void lvgl_set_center_notice(const char *text);
+static void lvgl_hold_center_notice(uint32_t hold_ms);
+static void lvgl_update_trigger_channel_dropdown_options(void);
+static void lvgl_apply_adc_channel_mode(bool show_notice);
 
 /**
  * @brief Atualiza a linha e o label visuais do nível de trigger.
@@ -664,6 +729,89 @@ static const lvgl_scope_timebase_t *lvgl_get_selected_timebase(void)
 }
 
 /**
+ * @brief Retorna se ambos os canais estão ativos na visualização atual.
+ *
+ * @return `true` quando a UI está exibindo Ch1 e Ch2 simultaneamente.
+ */
+static bool lvgl_dual_channel_active(void)
+{
+    return s_sample_channel_mode == 2U;
+}
+
+/**
+ * @brief Ajusta a base de tempo para respeitar as limitações do modo de canal atual.
+ *
+ * @param[in] show_notice Exibe aviso ao usuário caso a base precise ser corrigida.
+ */
+static void lvgl_enforce_timebase_for_channel_mode(bool show_notice)
+{
+    if (!lvgl_dual_channel_active()) {
+        return;
+    }
+
+    if (s_timebase_index != 0U) {
+        return;
+    }
+
+    s_timebase_index = 1U;
+    if (show_notice) {
+        lvgl_set_center_notice("1 ms/div so com\num canal ativo");
+        lvgl_hold_center_notice(1800U);
+    }
+}
+
+/**
+ * @brief Converte o índice real da base em índice visível no dropdown.
+ *
+ * @param[in] timebase_index Índice real em `s_timebase_options`.
+ *
+ * @return Índice correspondente no dropdown atual.
+ */
+static uint16_t lvgl_get_timebase_dropdown_index(uint16_t timebase_index)
+{
+    if (timebase_index >= (uint16_t)(sizeof(s_timebase_options) / sizeof(s_timebase_options[0]))) {
+        timebase_index = 0U;
+    }
+
+    if (lvgl_dual_channel_active()) {
+        return (timebase_index == 0U) ? 0U : (uint16_t)(timebase_index - 1U);
+    }
+
+    return timebase_index;
+}
+
+/**
+ * @brief Converte a seleção do dropdown em índice real da base de tempo.
+ *
+ * @param[in] dropdown_index Índice selecionado no dropdown.
+ *
+ * @return Índice correspondente em `s_timebase_options`.
+ */
+static uint16_t lvgl_get_timebase_index_from_dropdown(uint16_t dropdown_index)
+{
+    if (lvgl_dual_channel_active()) {
+        return (uint16_t)(dropdown_index + 1U);
+    }
+
+    return dropdown_index;
+}
+
+/**
+ * @brief Atualiza as opções do dropdown de base de tempo conforme o modo de canal.
+ */
+static void lvgl_update_timebase_dropdown_options(void)
+{
+    if (s_timebase_dropdown == NULL) {
+        return;
+    }
+
+    lv_dropdown_set_options_static(
+        s_timebase_dropdown,
+        lvgl_dual_channel_active() ? s_timebase_dropdown_options_dual : s_timebase_dropdown_options_single);
+    lv_dropdown_set_selected(s_timebase_dropdown, lvgl_get_timebase_dropdown_index(s_timebase_index));
+}
+
+/**
  * @brief Retorna a janela total exibida para um índice de base de tempo.
  *
  * @param[in] timebase_index Índice da base consultada.
@@ -698,16 +846,38 @@ static uint32_t lvgl_get_target_sample_freq_hz(void)
 {
     const uint32_t time_per_div_us = lvgl_get_selected_timebase()->time_per_div_us;
 
+    if (time_per_div_us <= 1000U) {
+        return 50000U;
+    }
+    if (time_per_div_us <= 2000U) {
+        return lvgl_dual_channel_active() ? 40000U : 50000U;
+    }
     if (time_per_div_us >= 1000000U) {
         return 5000U;
     }
     if (time_per_div_us >= 500000U) {
-        return 10000U;
+        return 5000U;
     }
     if (time_per_div_us >= 250000U) {
         return 15000U;
     }
     return 40000U;
+}
+
+/**
+ * @brief Reconfigura o tamanho do bloco fixo usado pelo modo livre.
+ */
+static void lvgl_sync_free_run_block_config(void)
+{
+    const size_t requested_samples = lvgl_get_requested_window_samples();
+
+    if (adc_scope_configure_free_run_block(requested_samples) != ESP_OK) {
+        ESP_LOGW(TAG, "Falha ao configurar bloco do free-run com %u amostras",
+                 (unsigned)requested_samples);
+        return;
+    }
+
+    s_history_block_offset = 0U;
 }
 
 /**
@@ -723,6 +893,7 @@ static void lvgl_apply_sample_freq_for_timebase(void)
     }
 
     if (current_hz == target_hz) {
+        lvgl_sync_free_run_block_config();
         return;
     }
 
@@ -732,6 +903,8 @@ static void lvgl_apply_sample_freq_for_timebase(void)
     }
 
     s_history_offset_samples = 0U;
+    s_history_block_offset = 0U;
+    lvgl_sync_free_run_block_config();
     lvgl_reset_free_run_sweep();
 }
 
@@ -744,6 +917,8 @@ static void lvgl_restart_history_for_timebase_change(void)
         ESP_LOGW(TAG, "Falha ao limpar historico apos troca de base");
     }
     s_history_offset_samples = 0U;
+    s_history_block_offset = 0U;
+    lvgl_sync_free_run_block_config();
     lvgl_reset_free_run_sweep();
 }
 
@@ -893,7 +1068,6 @@ static void lvgl_invalidate_free_run_state(bool clear_chart);
  * @param[in] requested_samples Janela temporal atual em amostras reais.
  * @param[in] snapshot Snapshot recém-renderizado usado como referência temporal.
  */
-static void lvgl_prime_free_run_sweep(size_t requested_samples, const adc_scope_snapshot_t *snapshot);
 
 /**
  * @brief Aplica um efeito visual de varredura contínua no modo livre.
@@ -901,7 +1075,6 @@ static void lvgl_prime_free_run_sweep(size_t requested_samples, const adc_scope_
  * @param[in] requested_samples Janela temporal atual em amostras reais.
  * @param[in] snapshot Snapshot recém-renderizado usado como referência temporal.
  */
-static void lvgl_publish_pending_points_free_run(size_t requested_samples, const adc_scope_snapshot_t *snapshot);
 
 /**
  * @brief Publica o estado atual da UI local para leitura pela interface web.
@@ -931,8 +1104,6 @@ static void lvgl_publish_control_state(void)
  */
 static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *state)
 {
-    const uint16_t old_timebase_index = s_timebase_index;
-
     if (state == NULL) {
         return;
     }
@@ -953,22 +1124,19 @@ static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *st
         s_trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF;
     }
 
-    lvgl_apply_sample_freq_for_timebase();
-    if (s_timebase_index != old_timebase_index) {
-        lvgl_restart_history_for_timebase_change();
-    }
+    lvgl_apply_adc_channel_mode(false);
 
     if (s_channel_dropdown != NULL) {
         lv_dropdown_set_selected(s_channel_dropdown, s_sample_channel_mode);
     }
     if (s_timebase_dropdown != NULL) {
-        lv_dropdown_set_selected(s_timebase_dropdown, s_timebase_index);
+        lvgl_update_timebase_dropdown_options();
     }
     if (s_volts_dropdown != NULL) {
         lv_dropdown_set_selected(s_volts_dropdown, s_voltscale_index);
     }
     if (s_trigger_channel_dropdown != NULL) {
-        lv_dropdown_set_selected(s_trigger_channel_dropdown, s_trigger_channel_index);
+        lvgl_update_trigger_channel_dropdown_options();
     }
     if (s_trigger_dropdown != NULL) {
         lv_dropdown_set_selected(s_trigger_dropdown, lvgl_trigger_dropdown_index_from_mode(s_trigger_mode));
@@ -981,8 +1149,10 @@ static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *st
         if (state->paused) {
             s_scope_paused = true;
             s_history_offset_samples = 0U;
+            s_history_block_offset = 0U;
+            s_pause_uses_block_history = false;
             (void)adc_scope_freeze_history_snapshot();
-            s_pause_anchor_channel = (s_sample_channel_mode == 1U) ? 1U : 0U;
+            s_pause_anchor_channel = 0U;
             s_pause_anchor_sequence =
                 (s_pause_anchor_channel < ADC_SCOPE_MAX_CHANNELS) ?
                     s_scope_snapshot.latest_sequence[s_pause_anchor_channel] : 0U;
@@ -992,6 +1162,8 @@ static void lvgl_apply_external_control_state(const lvgl_app_control_state_t *st
         } else {
             s_scope_paused = false;
             s_history_offset_samples = 0U;
+            s_history_block_offset = 0U;
+            s_pause_uses_block_history = false;
             (void)adc_scope_release_history_snapshot();
             s_pause_anchor_sequence = 0U;
             s_pause_display_locked = false;
@@ -1138,12 +1310,10 @@ static bool lvgl_try_estimate_frequency_from_history(size_t analysis_channel, ui
 {
     int32_t analysis_ch1[APP_ADC_CHART_POINTS] = {0};
     int32_t analysis_ch2[APP_ADC_CHART_POINTS] = {0};
-    int32_t *dest_buffers[ADC_SCOPE_MAX_CHANNELS] = {
-        analysis_ch1,
-        analysis_ch2,
-    };
+    int32_t *dest_buffers[ADC_SCOPE_MAX_CHANNELS] = {NULL, NULL};
     adc_scope_snapshot_t analysis_snapshot = {0};
     uint32_t sample_freq_hz = 0U;
+    size_t backend_analysis_channel = 0U;
 
     if (out_freq_tenths_hz == NULL) {
         return false;
@@ -1153,6 +1323,15 @@ static bool lvgl_try_estimate_frequency_from_history(size_t analysis_channel, ui
 
     if (adc_scope_get_sample_freq_hz(&sample_freq_hz) != ESP_OK || sample_freq_hz == 0U) {
         return false;
+    }
+
+    if (s_sample_channel_mode == 2U) {
+        dest_buffers[0] = analysis_ch1;
+        dest_buffers[1] = analysis_ch2;
+        backend_analysis_channel = analysis_channel;
+    } else {
+        dest_buffers[0] = analysis_ch1;
+        backend_analysis_channel = 0U;
     }
 
     for (uint16_t i = s_timebase_index; i < (uint16_t)(sizeof(s_timebase_options) / sizeof(s_timebase_options[0])); i++) {
@@ -1181,12 +1360,13 @@ static bool lvgl_try_estimate_frequency_from_history(size_t analysis_channel, ui
         }
 
         {
-            const int32_t *analysis_points = (analysis_channel == 0U) ? analysis_ch1 : analysis_ch2;
+            const int32_t *analysis_points =
+                (s_sample_channel_mode == 2U && analysis_channel == 1U) ? analysis_ch2 : analysis_ch1;
             const uint32_t estimated = lvgl_estimate_frequency_tenths_from_points(analysis_points,
                                                                                   APP_ADC_CHART_POINTS,
                                                                                   lvgl_get_total_window_us_for_index(i),
-                                                                                  analysis_snapshot.min_mv[analysis_channel],
-                                                                                  analysis_snapshot.max_mv[analysis_channel]);
+                                                                                  analysis_snapshot.min_mv[backend_analysis_channel],
+                                                                                  analysis_snapshot.max_mv[backend_analysis_channel]);
             if (estimated > 0U) {
                 *out_freq_tenths_hz = estimated;
                 return true;
@@ -1202,7 +1382,7 @@ static bool lvgl_try_estimate_frequency_from_history(size_t analysis_channel, ui
  */
 static void lvgl_apply_auto_settings(void)
 {
-    size_t analysis_channel = (s_sample_channel_mode == 1U) ? 1U : 0U;
+    size_t analysis_channel = 0U;
     uint32_t estimated_freq_tenths_hz = 0U;
     uint32_t desired_window_us = 0U;
     int32_t peak_mv = 0;
@@ -1226,7 +1406,7 @@ static void lvgl_apply_auto_settings(void)
     if (analysis_channel < ADC_SCOPE_MAX_CHANNELS && s_scope_snapshot.measurements_valid[analysis_channel]) {
         estimated_freq_tenths_hz = s_scope_snapshot.frequency_tenths_hz[analysis_channel];
     } else {
-        const int32_t *analysis_points = (analysis_channel == 0U) ? s_chart_points : s_chart_points_ch2;
+        const int32_t *analysis_points = (s_sample_channel_mode == 1U) ? s_chart_points_ch2 : s_chart_points;
         estimated_freq_tenths_hz = lvgl_estimate_frequency_tenths_from_points(analysis_points,
                                                                               APP_ADC_CHART_POINTS,
                                                                               lvgl_get_selected_total_window_us(),
@@ -1250,6 +1430,8 @@ static void lvgl_apply_auto_settings(void)
         }
     }
 
+    lvgl_enforce_timebase_for_channel_mode(false);
+
     s_trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF;
 
     lvgl_apply_sample_freq_for_timebase();
@@ -1261,7 +1443,7 @@ static void lvgl_apply_auto_settings(void)
         lv_dropdown_set_selected(s_volts_dropdown, s_voltscale_index);
     }
     if (s_timebase_dropdown != NULL) {
-        lv_dropdown_set_selected(s_timebase_dropdown, s_timebase_index);
+        lv_dropdown_set_selected(s_timebase_dropdown, lvgl_get_timebase_dropdown_index(s_timebase_index));
     }
     if (s_trigger_run_dropdown != NULL) {
         lv_dropdown_set_selected(s_trigger_run_dropdown, (uint16_t)ADC_SCOPE_TRIGGER_RUN_OFF);
@@ -1322,6 +1504,100 @@ static bool lvgl_channel_is_visible(size_t channel_index)
     }
 
     return s_sample_channel_mode == (uint16_t)channel_index;
+}
+
+/**
+ * @brief Retorna o canal de referência usado para ancorar a janela livre.
+ */
+static size_t lvgl_get_free_run_reference_channel(void)
+{
+    return 0U;
+}
+
+/**
+ * @brief Retorna o índice do canal dentro do backend ADC para o canal visual primário.
+ */
+static size_t lvgl_get_primary_backend_channel_index(void)
+{
+    return 0U;
+}
+
+/**
+ * @brief Retorna o índice do canal dentro do backend ADC para o canal visual secundário.
+ */
+static size_t lvgl_get_secondary_backend_channel_index(void)
+{
+    return 1U;
+}
+
+/**
+ * @brief Retorna o buffer pendente correspondente ao canal visual primário.
+ */
+static int32_t *lvgl_get_primary_pending_buffer(void)
+{
+    return (s_sample_channel_mode == 1U) ? s_chart_points_pending_ch2 : s_chart_points_pending;
+}
+
+/**
+ * @brief Atualiza as opções do dropdown de canal de trigger conforme o modo de canal.
+ */
+static void lvgl_update_trigger_channel_dropdown_options(void)
+{
+    if (s_trigger_channel_dropdown == NULL) {
+        return;
+    }
+
+    if (s_sample_channel_mode == 2U) {
+        lv_dropdown_set_options_static(s_trigger_channel_dropdown, s_trigger_channel_dropdown_options_dual);
+        lv_dropdown_set_selected(s_trigger_channel_dropdown, s_trigger_channel_index);
+        return;
+    }
+
+    s_trigger_channel_index = 0U;
+    lv_dropdown_set_options_static(
+        s_trigger_channel_dropdown,
+        (s_sample_channel_mode == 1U) ? s_trigger_channel_dropdown_options_ch2 : s_trigger_channel_dropdown_options_ch1);
+    lv_dropdown_set_selected(s_trigger_channel_dropdown, 0U);
+}
+
+/**
+ * @brief Reconfigura o ADC físico conforme o modo de canal ativo na UI.
+ */
+static void lvgl_apply_adc_channel_mode(bool show_notice)
+{
+    const uint16_t old_timebase_index = s_timebase_index;
+    size_t current_adc_channel_count = 0U;
+    const bool channel_count_known =
+        (adc_scope_get_channel_count(&current_adc_channel_count) == ESP_OK);
+    const size_t desired_adc_channel_count = (s_sample_channel_mode == 2U) ? 2U : 1U;
+    const bool increasing_channel_count =
+        channel_count_known && (desired_adc_channel_count > current_adc_channel_count);
+    const bool decreasing_channel_count =
+        channel_count_known && (desired_adc_channel_count < current_adc_channel_count);
+
+    lvgl_enforce_timebase_for_channel_mode(show_notice);
+    if (s_sample_channel_mode != 2U) {
+        s_trigger_channel_index = 0U;
+    }
+
+    if (increasing_channel_count) {
+        lvgl_apply_sample_freq_for_timebase();
+    }
+
+    if (adc_scope_set_active_channel_mode(s_sample_channel_mode) != ESP_OK) {
+        ESP_LOGW(TAG, "Falha ao aplicar modo de canal %u no ADC", (unsigned)s_sample_channel_mode);
+    }
+
+    lvgl_update_timebase_dropdown_options();
+    lvgl_update_trigger_channel_dropdown_options();
+    if (!increasing_channel_count || decreasing_channel_count) {
+        lvgl_apply_sample_freq_for_timebase();
+    }
+    lvgl_restart_history_for_timebase_change();
+
+    if (s_timebase_index != old_timebase_index && s_timebase_dropdown != NULL) {
+        lv_dropdown_set_selected(s_timebase_dropdown, lvgl_get_timebase_dropdown_index(s_timebase_index));
+    }
 }
 
 /**
@@ -1547,6 +1823,28 @@ static void lvgl_update_buffer_label(void)
                 percent = 100U;
             }
         }
+        lv_snprintf(buffer_text, sizeof(buffer_text), "Buffer: %u%%", percent);
+        lv_label_set_text(s_buffer_label, buffer_text);
+        return;
+    }
+
+    if (s_pause_uses_block_history) {
+        if (s_scope_snapshot.history_count <= 1U) {
+            lv_label_set_text(s_buffer_label, "Buffer: 0%");
+            return;
+        }
+
+        if (s_history_block_offset >= s_scope_snapshot.history_count) {
+            lv_label_set_text(s_buffer_label, "Buffer: 0%");
+            return;
+        }
+
+        window_end = (s_scope_snapshot.history_count - 1U) - s_history_block_offset;
+        percent = (unsigned)((window_end * 100U) / (s_scope_snapshot.history_count - 1U));
+        if (percent > 100U) {
+            percent = 100U;
+        }
+
         lv_snprintf(buffer_text, sizeof(buffer_text), "Buffer: %u%%", percent);
         lv_label_set_text(s_buffer_label, buffer_text);
         return;
@@ -1970,7 +2268,7 @@ static void lvgl_update_measurements(void)
                                          s_duty_label);
     } else {
         lvgl_update_channel_measurements(s_chart_points_ch2,
-                                         1U,
+                                         0U,
                                          true,
                                          s_rms_label,
                                          s_pk_label,
@@ -1997,17 +2295,21 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
     const adc_scope_trigger_mode_t active_trigger_mode = lvgl_get_active_trigger_mode();
     const adc_scope_trigger_run_mode_t active_trigger_run_mode =
         s_scope_paused ? ADC_SCOPE_TRIGGER_RUN_OFF : s_trigger_run_mode;
+    const bool use_circular_free_run = (active_trigger_mode == ADC_SCOPE_TRIGGER_FREE);
     size_t effective_history_offset_samples = s_history_offset_samples;
-    const bool use_free_run_sweep =
-        (!s_scope_paused &&
-         active_trigger_mode == ADC_SCOPE_TRIGGER_FREE &&
-         s_history_offset_samples == 0U);
-    int32_t *dest_buffers[ADC_SCOPE_MAX_CHANNELS] = {
-        s_chart_points_pending,
-        s_chart_points_pending_ch2,
-    };
+    int32_t *dest_buffers[ADC_SCOPE_MAX_CHANNELS] = {NULL, NULL};
     adc_scope_snapshot_t next_snapshot = {0};
+    uint64_t latest_sequence = 0U;
+    size_t shared_history_count = 0U;
+    size_t reference_channel = 0U;
     (void)timer;
+
+    if (s_sample_channel_mode == 2U) {
+        dest_buffers[0] = s_chart_points_pending;
+        dest_buffers[1] = s_chart_points_pending_ch2;
+    } else {
+        dest_buffers[0] = lvgl_get_primary_pending_buffer();
+    }
 
     if (scope_web_get_output_mode() == SCOPE_OUTPUT_MODE_WEB_ONLY) {
         lvgl_set_center_notice("So web ativo\nDisplay pausado");
@@ -2026,27 +2328,69 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    if (s_scope_paused && s_pause_display_locked && s_history_offset_samples == 0U) {
+    if (s_scope_paused &&
+        s_pause_display_locked &&
+        ((!s_pause_uses_block_history && s_history_offset_samples == 0U) ||
+         (s_pause_uses_block_history && s_history_block_offset == 0U))) {
         return;
     }
 
-    if (adc_scope_copy_chart_points_multi(dest_buffers,
-                                          APP_ADC_CHART_POINTS,
-                                          requested_samples,
-                                          active_trigger_mode,
-                                          active_trigger_run_mode,
-                                          s_trigger_channel_index,
-                                          LVGL_SCOPE_TRIGGER_POS,
-                                          effective_history_offset_samples,
-                                          s_scope_paused,
-                                          s_pause_anchor_sequence,
-                                          s_trigger_level_mv,
-                                          0U,
-                                          &next_snapshot) != ESP_OK) {
-        return;
+    if (use_circular_free_run && !s_scope_paused) {
+        const size_t step_samples =
+            (requested_samples >= LVGL_SCOPE_TIME_DIVS) ? (requested_samples / LVGL_SCOPE_TIME_DIVS) : 1U;
+
+        reference_channel = lvgl_get_free_run_reference_channel();
+        if (adc_scope_get_circular_status(reference_channel,
+                                          &latest_sequence,
+                                          &shared_history_count) != ESP_OK) {
+            return;
+        }
+        if (shared_history_count == 0U) {
+            return;
+        }
+
+        if (!s_free_run_sweep_active ||
+            s_free_run_last_requested_samples != requested_samples ||
+            s_free_run_last_channel_mode != s_sample_channel_mode) {
+            s_free_run_sweep_active = true;
+            s_free_run_last_requested_samples = requested_samples;
+            s_free_run_last_channel_mode = s_sample_channel_mode;
+            s_free_run_display_end_sequence = latest_sequence;
+        } else if (latest_sequence > s_free_run_display_end_sequence) {
+            const uint64_t delta_seq = latest_sequence - s_free_run_display_end_sequence;
+            const uint64_t steps = delta_seq / (uint64_t)step_samples;
+            if (steps > 0U) {
+                s_free_run_display_end_sequence += steps * (uint64_t)step_samples;
+            }
+        }
+
+        if (adc_scope_copy_free_run_circular_window_multi(dest_buffers,
+                                                          APP_ADC_CHART_POINTS,
+                                                          requested_samples,
+                                                          s_free_run_display_end_sequence,
+                                                          s_trigger_level_mv,
+                                                          &next_snapshot) != ESP_OK) {
+            return;
+        }
+    } else {
+        if (adc_scope_copy_chart_points_multi(dest_buffers,
+                                              APP_ADC_CHART_POINTS,
+                                              requested_samples,
+                                              active_trigger_mode,
+                                              active_trigger_run_mode,
+                                              s_trigger_channel_index,
+                                              LVGL_SCOPE_TRIGGER_POS,
+                                              effective_history_offset_samples,
+                                              s_scope_paused,
+                                              s_pause_anchor_sequence,
+                                              s_trigger_level_mv,
+                                              0U,
+                                              &next_snapshot) != ESP_OK) {
+            return;
+        }
     }
 
-    if (!s_scope_paused && s_capture_resume_wait_full_window) {
+    if (!use_circular_free_run && !s_scope_paused && s_capture_resume_wait_full_window) {
         if (next_snapshot.sample_count < requested_samples) {
             s_scope_snapshot = next_snapshot;
             lvgl_update_buffer_label();
@@ -2067,13 +2411,8 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    if (use_free_run_sweep) {
-        lvgl_reset_free_run_sweep();
-        lvgl_publish_pending_points_full();
-    } else {
-        lvgl_reset_free_run_sweep();
-        lvgl_publish_pending_points_full();
-    }
+    lvgl_reset_free_run_sweep();
+    lvgl_publish_pending_points_full();
 
     s_scope_snapshot = next_snapshot;
 
@@ -2124,6 +2463,7 @@ static void lvgl_channel_dropdown_event_cb(lv_event_t *e)
         s_sample_channel_mode = 2U;
     }
 
+    lvgl_apply_adc_channel_mode(true);
     lvgl_update_scope_layout();
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
@@ -2141,6 +2481,7 @@ static void lvgl_invalidate_free_run_state(bool clear_chart)
     s_free_run_last_sequence = 0U;
     s_free_run_scroll_accum_fp = 0U;
     s_free_run_last_window_start_fp = 0U;
+    s_free_run_display_end_sequence = 0U;
     if (clear_chart) {
         for (size_t i = 0; i < APP_ADC_CHART_POINTS; i++) {
             s_chart_points[i] = INT32_MAX;
@@ -2160,31 +2501,22 @@ static void lvgl_reset_free_run_sweep(void)
  * @param[in] requested_samples Janela temporal atual em amostras reais.
  * @param[in] latest_sequence Sequência absoluta mais recente do canal de referência.
  */
-static void lvgl_prime_free_run_sweep(size_t requested_samples, const adc_scope_snapshot_t *snapshot)
-{
-    const size_t sequence_channel = (s_sample_channel_mode == 1U) ? 1U : 0U;
-
-    s_free_run_sweep_active = true;
-    s_free_run_visible_points = APP_ADC_CHART_POINTS;
-    s_free_run_last_requested_samples = requested_samples;
-    s_free_run_last_channel_mode = s_sample_channel_mode;
-    s_free_run_last_sequence =
-        (snapshot != NULL && sequence_channel < ADC_SCOPE_MAX_CHANNELS) ?
-            snapshot->latest_sequence[sequence_channel] : 0U;
-    s_free_run_last_window_start_fp =
-        (snapshot != NULL && sequence_channel < ADC_SCOPE_MAX_CHANNELS) ?
-            snapshot->window_start_fp_q10[sequence_channel] : 0U;
-    s_free_run_scroll_accum_fp = 0U;
-}
-
 /**
  * @brief Copia a janela recém-renderizada integralmente para o chart.
  */
 static void lvgl_publish_pending_points_full(void)
 {
     for (size_t i = 0; i < APP_ADC_CHART_POINTS; i++) {
-        s_chart_points[i] = lvgl_channel_is_visible(0U) ? s_chart_points_pending[i] : INT32_MAX;
-        s_chart_points_ch2[i] = lvgl_channel_is_visible(1U) ? s_chart_points_pending_ch2[i] : INT32_MAX;
+        if (s_sample_channel_mode == 2U) {
+            s_chart_points[i] = s_chart_points_pending[i];
+            s_chart_points_ch2[i] = s_chart_points_pending_ch2[i];
+        } else if (s_sample_channel_mode == 1U) {
+            s_chart_points[i] = INT32_MAX;
+            s_chart_points_ch2[i] = s_chart_points_pending_ch2[i];
+        } else {
+            s_chart_points[i] = s_chart_points_pending[i];
+            s_chart_points_ch2[i] = INT32_MAX;
+        }
     }
 }
 
@@ -2193,91 +2525,6 @@ static void lvgl_publish_pending_points_full(void)
  *
  * @param[in] requested_samples Janela temporal atual em amostras reais.
  */
-static void lvgl_publish_pending_points_free_run(size_t requested_samples, const adc_scope_snapshot_t *snapshot)
-{
-    size_t delta_points = 0U;
-    const bool ch1_visible = lvgl_channel_is_visible(0U);
-    const bool ch2_visible = lvgl_channel_is_visible(1U);
-    const size_t sequence_channel = (s_sample_channel_mode == 1U) ? 1U : 0U;
-    const uint64_t current_sequence =
-        (snapshot != NULL && sequence_channel < ADC_SCOPE_MAX_CHANNELS) ?
-            snapshot->latest_sequence[sequence_channel] : 0U;
-    const uint64_t current_window_start_fp =
-        (snapshot != NULL && sequence_channel < ADC_SCOPE_MAX_CHANNELS) ?
-            snapshot->window_start_fp_q10[sequence_channel] : 0U;
-
-    if (!s_free_run_sweep_active ||
-        s_free_run_last_requested_samples != requested_samples ||
-        s_free_run_last_channel_mode != s_sample_channel_mode) {
-        lvgl_reset_free_run_sweep();
-        s_free_run_sweep_active = true;
-        s_free_run_last_requested_samples = requested_samples;
-        s_free_run_last_channel_mode = s_sample_channel_mode;
-        s_free_run_last_sequence = current_sequence;
-        s_free_run_last_window_start_fp = current_window_start_fp;
-    }
-
-    if (requested_samples > 0U) {
-        if (requested_samples >= (APP_ADC_CHART_POINTS * 4U)) {
-            const uint64_t step_fp =
-                ((uint64_t)requested_samples * 1024ULL) / (uint64_t)APP_ADC_CHART_POINTS;
-
-            if (step_fp > 0U && current_window_start_fp >= s_free_run_last_window_start_fp) {
-                s_free_run_scroll_accum_fp += current_window_start_fp - s_free_run_last_window_start_fp;
-                delta_points = (size_t)(s_free_run_scroll_accum_fp / step_fp);
-                s_free_run_scroll_accum_fp %= step_fp;
-            }
-        } else if (APP_ADC_CHART_POINTS > 1U) {
-            const uint64_t step_fp =
-                ((uint64_t)(requested_samples - 1U) * 1024ULL) / (uint64_t)(APP_ADC_CHART_POINTS - 1U);
-
-            if (step_fp > 0U && current_window_start_fp >= s_free_run_last_window_start_fp) {
-                s_free_run_scroll_accum_fp += current_window_start_fp - s_free_run_last_window_start_fp;
-                delta_points = (size_t)(s_free_run_scroll_accum_fp / step_fp);
-                s_free_run_scroll_accum_fp %= step_fp;
-            }
-        }
-    }
-    s_free_run_last_sequence = current_sequence;
-    s_free_run_last_window_start_fp = current_window_start_fp;
-
-    if (s_free_run_visible_points < APP_ADC_CHART_POINTS) {
-        const size_t old_visible_points = s_free_run_visible_points;
-        size_t visible_points = old_visible_points + ((delta_points > 0U) ? delta_points : 1U);
-        if (visible_points > APP_ADC_CHART_POINTS) {
-            visible_points = APP_ADC_CHART_POINTS;
-        }
-
-        for (size_t i = old_visible_points; i < visible_points; i++) {
-            s_chart_points[i] = ch1_visible ? s_chart_points_pending[i] : INT32_MAX;
-            s_chart_points_ch2[i] = ch2_visible ? s_chart_points_pending_ch2[i] : INT32_MAX;
-        }
-
-        s_free_run_visible_points = visible_points;
-        return;
-    }
-
-    if (delta_points == 0U) {
-        return;
-    }
-
-    if (delta_points >= APP_ADC_CHART_POINTS) {
-        lvgl_publish_pending_points_full();
-        s_free_run_visible_points = APP_ADC_CHART_POINTS;
-        return;
-    }
-
-    for (size_t i = 0; i < (APP_ADC_CHART_POINTS - delta_points); i++) {
-        s_chart_points[i] = s_chart_points[i + delta_points];
-        s_chart_points_ch2[i] = s_chart_points_ch2[i + delta_points];
-    }
-
-    for (size_t i = APP_ADC_CHART_POINTS - delta_points; i < APP_ADC_CHART_POINTS; i++) {
-        s_chart_points[i] = ch1_visible ? s_chart_points_pending[i] : INT32_MAX;
-        s_chart_points_ch2[i] = ch2_visible ? s_chart_points_pending_ch2[i] : INT32_MAX;
-    }
-}
-
 /**
  * @brief Callback do dropdown de seleção do canal de trigger.
  *
@@ -2293,7 +2540,9 @@ static void lvgl_trigger_channel_dropdown_event_cb(lv_event_t *e)
     }
 
     s_trigger_channel_index = (uint16_t)lv_dropdown_get_selected(lv_event_get_target_obj(e));
-    if (s_trigger_channel_index > 1U) {
+    if (s_sample_channel_mode != 2U) {
+        s_trigger_channel_index = 0U;
+    } else if (s_trigger_channel_index > 1U) {
         s_trigger_channel_index = 0U;
     }
 
@@ -2378,7 +2627,7 @@ static void lvgl_timebase_dropdown_event_cb(lv_event_t *e)
         return;
     }
 
-    s_timebase_index = (uint16_t)lv_dropdown_get_selected(lv_event_get_target_obj(e));
+    s_timebase_index = lvgl_get_timebase_index_from_dropdown((uint16_t)lv_dropdown_get_selected(lv_event_get_target_obj(e)));
     if (s_timebase_index >= (uint16_t)(sizeof(s_timebase_options) / sizeof(s_timebase_options[0]))) {
         s_timebase_index = 0U;
     }
@@ -2528,7 +2777,9 @@ static void lvgl_status_dropdown_event_cb(lv_event_t *e)
 
     if (selected == 0U) {
         s_history_offset_samples = 0U;
+        s_history_block_offset = 0U;
         s_scope_paused = false;
+        s_pause_uses_block_history = false;
         (void)adc_scope_release_history_snapshot();
         s_pause_anchor_sequence = 0U;
         s_pause_display_locked = false;
@@ -2538,8 +2789,10 @@ static void lvgl_status_dropdown_event_cb(lv_event_t *e)
     } else {
         s_scope_paused = true;
         s_history_offset_samples = 0U;
+        s_history_block_offset = 0U;
+        s_pause_uses_block_history = false;
         (void)adc_scope_freeze_history_snapshot();
-        s_pause_anchor_channel = (s_sample_channel_mode == 1U) ? 1U : 0U;
+        s_pause_anchor_channel = 0U;
         s_pause_anchor_sequence =
             (s_pause_anchor_channel < ADC_SCOPE_MAX_CHANNELS) ?
                 s_scope_snapshot.latest_sequence[s_pause_anchor_channel] : 0U;
@@ -2580,6 +2833,7 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
         s_drag_start_x = point.x;
         s_drag_start_y = point.y;
         s_drag_start_offset_samples = s_history_offset_samples;
+        s_drag_start_block_offset = s_history_block_offset;
         s_drag_start_trigger_level_mv = s_trigger_level_mv;
         s_cursor_drag_active = false;
 
@@ -2661,9 +2915,7 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
         lv_area_t content_coords = {0};
         size_t max_offset = 0U;
         int32_t delta_x = 0;
-        int32_t delta_y = 0;
         size_t delta_samples = 0U;
-        int32_t delta_mv = 0;
         int32_t local_x = 0;
         int32_t local_y = 0;
 
@@ -2676,7 +2928,6 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
         local_x = point.x - content_coords.x1;
         local_y = point.y - content_coords.y1;
         delta_x = (int32_t)point.x - (int32_t)s_drag_start_x;
-        delta_y = (int32_t)point.y - (int32_t)s_drag_start_y;
 
         if (s_cursor_mode != LVGL_CURSOR_MODE_OFF && s_cursor_drag_active) {
             if (s_cursor_mode == LVGL_CURSOR_MODE_TIME) {
@@ -2744,22 +2995,44 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
             return;
         }
 
-        if (s_scope_snapshot.history_count > requested_samples) {
-            max_offset = s_scope_snapshot.history_count - requested_samples;
-        }
+        if (s_pause_uses_block_history) {
+            if (s_scope_snapshot.history_count > 0U) {
+                max_offset = s_scope_snapshot.history_count - 1U;
+            }
 
-        delta_samples = (size_t)(((uint64_t)(delta_x >= 0 ? delta_x : -delta_x) * (uint64_t)requested_samples) / width_px);
+            delta_samples =
+                (size_t)(((uint64_t)(delta_x >= 0 ? delta_x : -delta_x) * (uint64_t)(max_offset + 1U)) / width_px);
 
-        if (delta_x > 0) {
-            s_history_offset_samples = s_drag_start_offset_samples + delta_samples;
-            if (s_history_offset_samples > max_offset) {
-                s_history_offset_samples = max_offset;
+            if (delta_x > 0) {
+                s_history_block_offset = s_drag_start_block_offset + delta_samples;
+                if (s_history_block_offset > max_offset) {
+                    s_history_block_offset = max_offset;
+                }
+            } else {
+                if (delta_samples >= s_drag_start_block_offset) {
+                    s_history_block_offset = 0U;
+                } else {
+                    s_history_block_offset = s_drag_start_block_offset - delta_samples;
+                }
             }
         } else {
-            if (delta_samples >= s_drag_start_offset_samples) {
-                s_history_offset_samples = 0U;
+            if (s_scope_snapshot.history_count > requested_samples) {
+                max_offset = s_scope_snapshot.history_count - requested_samples;
+            }
+
+            delta_samples = (size_t)(((uint64_t)(delta_x >= 0 ? delta_x : -delta_x) * (uint64_t)requested_samples) / width_px);
+
+            if (delta_x > 0) {
+                s_history_offset_samples = s_drag_start_offset_samples + delta_samples;
+                if (s_history_offset_samples > max_offset) {
+                    s_history_offset_samples = max_offset;
+                }
             } else {
-                s_history_offset_samples = s_drag_start_offset_samples - delta_samples;
+                if (delta_samples >= s_drag_start_offset_samples) {
+                    s_history_offset_samples = 0U;
+                } else {
+                    s_history_offset_samples = s_drag_start_offset_samples - delta_samples;
+                }
             }
         }
 
@@ -2846,9 +3119,7 @@ static void lvgl_create_scope_ui(void)
     lv_obj_align(trigger_channel_caption, LV_ALIGN_TOP_LEFT, 10, 4);
 
     s_trigger_channel_dropdown = lv_dropdown_create(trigger_channel_group);
-    lv_dropdown_set_options_static(s_trigger_channel_dropdown,
-                                   "Ch 1\n"
-                                   "Ch 2");
+    lv_dropdown_set_options_static(s_trigger_channel_dropdown, s_trigger_channel_dropdown_options_dual);
     lv_dropdown_set_selected(s_trigger_channel_dropdown, s_trigger_channel_index);
     lv_obj_set_size(s_trigger_channel_dropdown, slot_width - 20, LV_SIZE_CONTENT);
     lv_obj_align_to(s_trigger_channel_dropdown, trigger_channel_caption, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
@@ -2890,22 +3161,14 @@ static void lvgl_create_scope_ui(void)
     lv_obj_align(timebase_caption, LV_ALIGN_TOP_LEFT, 10, 4);
 
     s_timebase_dropdown = lv_dropdown_create(timebase_group);
-    lv_dropdown_set_options_static(s_timebase_dropdown,
-                                   "5 ms\n"
-                                   "10 ms\n"
-                                   "15 ms\n"
-                                   "20 ms\n"
-                                   "25 ms\n"
-                                   "50 ms\n"
-                                   "100 ms\n"
-                                   "250 ms\n"
-                                   "500 ms\n"
-                                   "1 s");
-    lv_dropdown_set_selected(s_timebase_dropdown, s_timebase_index);
+    lv_dropdown_set_options_static(s_timebase_dropdown, s_timebase_dropdown_options_single);
+    lv_dropdown_set_selected(s_timebase_dropdown, lvgl_get_timebase_dropdown_index(s_timebase_index));
     lv_obj_set_size(s_timebase_dropdown, slot_width - 20, LV_SIZE_CONTENT);
     lv_obj_align_to(s_timebase_dropdown, timebase_caption, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
     lvgl_style_dropdown(s_timebase_dropdown, lv_color_hex(LVGL_COLOR_TIMEBASE));
     lv_obj_add_event_cb(s_timebase_dropdown, lvgl_timebase_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lvgl_update_timebase_dropdown_options();
+    lvgl_update_trigger_channel_dropdown_options();
 
     trigger_group = lv_obj_create(s_controls_strip);
     lv_obj_remove_style_all(trigger_group);
@@ -3277,6 +3540,8 @@ static void lvgl_create_scope_ui(void)
     lvgl_style_metric_label(s_duty_label_ch2, lv_color_hex(LVGL_COLOR_TRACE_CH2));
     lv_obj_align(s_duty_label_ch2, LV_ALIGN_BOTTOM_LEFT, 0, -1);
 
+    lvgl_apply_adc_channel_mode(false);
+    lvgl_sync_free_run_block_config();
     lvgl_update_scope_layout();
     lvgl_update_center_grid_lines();
     lv_timer_create(lvgl_scope_refresh_timer_cb, LVGL_SCOPE_REFRESH_MS, NULL);

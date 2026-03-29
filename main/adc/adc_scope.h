@@ -17,6 +17,7 @@ extern "C" {
 
 /** @brief Quantidade máxima de canais analógicos tratados pelo módulo. */
 #define ADC_SCOPE_MAX_CHANNELS (2U)
+#define ADC_SCOPE_FREE_HISTORY_BLOCKS (32U)
 
 /**
  * @brief Modos de aquisição suportados pelo módulo.
@@ -182,6 +183,19 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
  */
 esp_err_t adc_scope_get_sample_freq_hz(uint32_t *out_sample_freq_hz);
 
+esp_err_t adc_scope_get_effective_sample_freq_hz(uint32_t *out_sample_freq_hz);
+
+esp_err_t adc_scope_get_circular_status(size_t channel_index,
+                                        uint64_t *out_latest_sequence,
+                                        size_t *out_shared_history_count);
+
+esp_err_t adc_scope_copy_free_run_circular_window_multi(int32_t *dest_per_channel[ADC_SCOPE_MAX_CHANNELS],
+                                                        size_t point_count,
+                                                        size_t requested_samples,
+                                                        uint64_t display_end_sequence,
+                                                        int32_t trigger_level_mv,
+                                                        adc_scope_snapshot_t *out_snapshot);
+
 /**
  * @brief Limpa o histórico atual de captura e invalida sweeps/cache dependentes.
  *
@@ -193,6 +207,14 @@ esp_err_t adc_scope_freeze_history_snapshot(void);
 
 esp_err_t adc_scope_release_history_snapshot(void);
 
+esp_err_t adc_scope_configure_free_run_block(size_t sample_count);
+
+esp_err_t adc_scope_get_free_run_block(int32_t *dest_per_channel[ADC_SCOPE_MAX_CHANNELS],
+                                       size_t point_count,
+                                       size_t history_block_offset,
+                                       adc_scope_snapshot_t *out_snapshot,
+                                       bool *out_available);
+
 /**
  * @brief Reconfigura a frequência de amostragem por canal do ADC contínuo.
  *
@@ -201,6 +223,15 @@ esp_err_t adc_scope_release_history_snapshot(void);
  * @return `ESP_OK` em caso de sucesso.
  */
 esp_err_t adc_scope_set_sample_freq_hz(uint32_t sample_freq_hz);
+
+/**
+ * @brief Reconfigura quantos canais físicos o ADC contínuo deve amostrar.
+ *
+ * @param[in] sample_channel_mode 0=Ch1, 1=Ch2, 2=Ch1+Ch2.
+ *
+ * @return `ESP_OK` em caso de sucesso.
+ */
+esp_err_t adc_scope_set_active_channel_mode(uint16_t sample_channel_mode);
 
 /**
  * @brief Retorna a quantidade de canais configurados.
