@@ -440,7 +440,7 @@ static void lvgl_make_chart_overlay_passthrough(lv_obj_t *obj)
  */
 static bool lvgl_timebase_allows_trigger(void)
 {
-    return s_timebase_options[s_timebase_index].total_window_us < 1000000U;
+    return true;
 }
 
 /**
