@@ -1149,6 +1149,8 @@ static void lvgl_apply_auto_settings(void)
         }
     }
 
+    s_trigger_run_mode = ADC_SCOPE_TRIGGER_RUN_OFF;
+
     lvgl_apply_sample_freq_for_timebase();
 
     if (s_volts_dropdown != NULL) {
@@ -1156,6 +1158,12 @@ static void lvgl_apply_auto_settings(void)
     }
     if (s_timebase_dropdown != NULL) {
         lv_dropdown_set_selected(s_timebase_dropdown, s_timebase_index);
+    }
+    if (s_trigger_run_dropdown != NULL) {
+        lv_dropdown_set_selected(s_trigger_run_dropdown, (uint16_t)ADC_SCOPE_TRIGGER_RUN_OFF);
+    }
+    if (s_trigger_dropdown != NULL) {
+        lv_dropdown_set_selected(s_trigger_dropdown, lvgl_trigger_dropdown_index_from_mode(s_trigger_mode));
     }
 
     if (s_trigger_level_mv > lvgl_get_chart_y_max_mv()) {
@@ -1168,6 +1176,8 @@ static void lvgl_apply_auto_settings(void)
         s_cursor_voltage_mv_2 = lvgl_get_chart_y_max_mv();
     }
 
+    lvgl_sync_adc_trigger_monitor();
+    lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
     lvgl_hold_center_notice(2000U);
 }
