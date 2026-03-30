@@ -30,9 +30,6 @@ static const char *TAG = "adc_scope";
 #define ADC_SCOPE_NOTIFY_DATA      (1UL << 0)
 #define ADC_SCOPE_NOTIFY_CONTROL   (1UL << 1)
 
-/** @brief Quantidade de eventos reais de trigger retidos para compor a janela. */
-#define ADC_SCOPE_TRIGGER_EVENT_QUEUE_LEN (16U)
-
 /** @brief Estado interno do módulo de aquisição. */
 typedef struct {
     adc_scope_config_t config;                                 /**< Cópia local da configuração do usuário. */
@@ -91,20 +88,10 @@ typedef struct {
     int8_t trigger_detector_zone;                              /**< Zona estável atual do detector: -1 abaixo, +1 acima. */
     uint64_t trigger_last_event_seq;                           /**< Último evento emitido pelo detector. */
     uint32_t trigger_holdoff_samples;                          /**< Holdoff mínimo entre eventos sucessivos. */
-    uint64_t trigger_event_seq[ADC_SCOPE_TRIGGER_EVENT_QUEUE_LEN]; /**< Fila circular de eventos refinados. */
-    size_t trigger_event_head;                                 /**< Próxima posição de escrita da fila de eventos. */
-    size_t trigger_event_count;                                /**< Quantidade válida de eventos na fila. */
-    bool trigger_anchor_valid;                                 /**< Indica se existe uma sweep triggerizada reaproveitável. */
-    uint64_t trigger_anchor_seq;                               /**< Evento âncora atual da sweep triggerizada. */
-    size_t trigger_anchor_channel_index;                       /**< Canal da sweep âncora. */
-    adc_scope_trigger_mode_t trigger_anchor_mode;              /**< Polaridade da sweep âncora. */
-    size_t trigger_anchor_requested_samples;                   /**< Janela usada na sweep âncora. */
-    size_t trigger_anchor_trigger_point_index;                 /**< Posição horizontal usada na sweep âncora. */
     int32_t *trigger_cache_points[ADC_SCOPE_MAX_CHANNELS];     /**< Sweep triggerizada já renderizada por canal. */
     adc_scope_snapshot_t trigger_cache_snapshot;               /**< Snapshot associado à sweep em cache. */
     adc_scope_snapshot_t free_run_history_snapshot[ADC_SCOPE_FREE_HISTORY_BLOCKS]; /**< Snapshots dos blocos livres renderizados. */
     bool trigger_cache_valid;                                  /**< Indica se existe uma sweep renderizada válida em cache. */
-    uint64_t trigger_cache_seq;                                /**< Evento base usado na sweep em cache. */
     size_t trigger_cache_requested_samples;                    /**< Janela usada no cache. */
     size_t trigger_cache_trigger_point_index;                  /**< Posição horizontal usada no cache. */
     size_t trigger_cache_channel_index;                        /**< Canal de trigger usado no cache. */
@@ -112,9 +99,6 @@ typedef struct {
     int16_t *trigger_sweep_mv_buffer[ADC_SCOPE_MAX_CHANNELS];  /**< Buffer fechado com a sweep triggerizada por canal. */
     bool trigger_sweep_pending;                                /**< Indica sweep aguardando pós-trigger suficiente. */
     uint64_t trigger_sweep_pending_seq;                        /**< Evento da sweep pendente. */
-    bool trigger_sweep_valid;                                  /**< Indica sweep fechada pronta para uso. */
-    size_t trigger_sweep_sample_count;                         /**< Quantidade de amostras reais na sweep fechada. */
-    size_t trigger_sweep_trigger_index;                        /**< Índice do trigger dentro da sweep fechada. */
     size_t trigger_config_requested_samples;                   /**< Janela configurada para o trigger. */
     size_t trigger_config_trigger_point_index;                 /**< Posição de trigger configurada. */
     adc_scope_trigger_run_mode_t trigger_config_run_mode;      /**< Run mode configurado para o trigger. */
@@ -399,30 +383,10 @@ static void adc_scope_measure_linear_buffer(const int16_t *source,
  */
 static void adc_scope_reset_trigger_events_locked(void)
 {
-    s_scope.trigger_event_head = 0U;
-    s_scope.trigger_event_count = 0U;
     s_scope.trigger_last_event_seq = 0U;
     s_scope.trigger_detector_zone = 0;
-    s_scope.trigger_anchor_valid = false;
-    s_scope.trigger_anchor_seq = 0U;
     s_scope.trigger_sweep_pending = false;
-    s_scope.trigger_sweep_valid = false;
     s_scope.trigger_sweep_pending_seq = 0U;
-    s_scope.trigger_sweep_sample_count = 0U;
-}
-
-/**
- * @brief Adiciona um novo evento refinado de trigger na fila circular.
- *
- * @param[in] sample_seq Sequência absoluta da amostra associada ao evento.
- */
-static void adc_scope_push_trigger_event_locked(uint64_t sample_seq)
-{
-    s_scope.trigger_event_seq[s_scope.trigger_event_head] = sample_seq;
-    s_scope.trigger_event_head = (s_scope.trigger_event_head + 1U) % ADC_SCOPE_TRIGGER_EVENT_QUEUE_LEN;
-    if (s_scope.trigger_event_count < ADC_SCOPE_TRIGGER_EVENT_QUEUE_LEN) {
-        s_scope.trigger_event_count++;
-    }
 }
 
 
@@ -789,7 +753,6 @@ static void adc_scope_process_samples(const uint8_t *data, uint32_t size)
                     ((s_scope.trigger_monitor_mode == ADC_SCOPE_TRIGGER_RISE && rising) ||
                      (s_scope.trigger_monitor_mode == ADC_SCOPE_TRIGGER_FALL && falling))) {
                     if (!s_scope.trigger_sweep_pending) {
-                        adc_scope_push_trigger_event_locked(event_seq);
                         s_scope.trigger_last_event_seq = event_seq;
                         s_scope.trigger_sweep_pending = true;
                         s_scope.trigger_sweep_pending_seq = event_seq;
@@ -896,14 +859,10 @@ static void adc_scope_process_samples(const uint8_t *data, uint32_t size)
 
                     s_scope.trigger_cache_snapshot = sweep_snapshot;
                     s_scope.trigger_cache_valid = true;
-                    s_scope.trigger_cache_seq = s_scope.trigger_sweep_pending_seq;
                     s_scope.trigger_cache_requested_samples = s_scope.trigger_config_requested_samples;
                     s_scope.trigger_cache_trigger_point_index = s_scope.trigger_config_trigger_point_index;
                     s_scope.trigger_cache_channel_index = s_scope.trigger_monitor_channel_index;
                     s_scope.trigger_cache_mode = s_scope.trigger_monitor_mode;
-                    s_scope.trigger_sweep_valid = true;
-                    s_scope.trigger_sweep_sample_count = s_scope.trigger_config_requested_samples;
-                    s_scope.trigger_sweep_trigger_index = pretrigger_samples;
                     s_scope.trigger_sweep_pending = false;
                 }
             }
@@ -1567,7 +1526,6 @@ esp_err_t adc_scope_copy_chart_points_multi(int32_t *dest_per_channel[ADC_SCOPE_
     trigger_cache_compatible =
         (trigger_mode != ADC_SCOPE_TRIGGER_FREE) &&
         s_scope.trigger_cache_valid &&
-        ((trigger_run_mode != ADC_SCOPE_TRIGGER_RUN_AUTO) || s_scope.trigger_sweep_valid) &&
         s_scope.trigger_cache_requested_samples == requested_samples &&
         s_scope.trigger_cache_trigger_point_index == trigger_point_index &&
         s_scope.trigger_cache_channel_index == trigger_channel_index &&
@@ -1831,7 +1789,6 @@ esp_err_t adc_scope_configure_trigger_monitor(size_t trigger_channel_index,
     s_scope.trigger_config_run_mode = trigger_run_mode;
     adc_scope_reset_trigger_events_locked();
     s_scope.trigger_cache_valid = false;
-    s_scope.trigger_sweep_valid = false;
     s_scope.trigger_sweep_pending = false;
     s_scope.prev_mv_valid[trigger_channel_index] = false;
 
@@ -2086,14 +2043,7 @@ esp_err_t adc_scope_copy_trigger_window_multi(int32_t *dest_per_channel[ADC_SCOP
 {
     adc_scope_snapshot_t snapshot = {0};
     bool trigger_cache_compatible = false;
-    bool trigger_pending = false;
     size_t shared_count = 0U;
-    size_t oldest_start[ADC_SCOPE_MAX_CHANNELS] = {0};
-    size_t source_window_start[ADC_SCOPE_MAX_CHANNELS] = {0};
-    uint64_t shared_oldest_sequence = 0U;
-    uint64_t shared_newest_sequence = 0U;
-    bool shared_sequence_valid = false;
-    size_t pretrigger_samples = 0U;
 
     ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
     ESP_RETURN_ON_FALSE(dest_per_channel != NULL, ESP_ERR_INVALID_ARG, TAG, "destinos nulos");
@@ -2142,31 +2092,6 @@ esp_err_t adc_scope_copy_trigger_window_multi(int32_t *dest_per_channel[ADC_SCOP
         snapshot.duty_tenths_percent[i] = 0U;
         snapshot.measurements_valid[i] = false;
         snapshot.calibrated[i] = s_scope.calibrated[i];
-        oldest_start[i] =
-            (s_scope.circular_head[i] + s_scope.config.circular_buffer_capacity - s_scope.circular_count[i]) %
-            s_scope.config.circular_buffer_capacity;
-        if (s_scope.circular_count[i] > 0U) {
-            const uint64_t channel_oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
-            const uint64_t channel_newest_sequence = s_scope.sample_sequence[i];
-
-            if (!shared_sequence_valid) {
-                shared_oldest_sequence = channel_oldest_sequence;
-                shared_newest_sequence = channel_newest_sequence;
-                shared_sequence_valid = true;
-            } else {
-                if (channel_oldest_sequence > shared_oldest_sequence) {
-                    shared_oldest_sequence = channel_oldest_sequence;
-                }
-                if (channel_newest_sequence < shared_newest_sequence) {
-                    shared_newest_sequence = channel_newest_sequence;
-                }
-            }
-        }
-    }
-
-    if (point_count > 1U) {
-        pretrigger_samples =
-            ((requested_samples - 1U) * trigger_point_index) / (point_count - 1U);
     }
 
     trigger_cache_compatible =
@@ -2175,14 +2100,6 @@ esp_err_t adc_scope_copy_trigger_window_multi(int32_t *dest_per_channel[ADC_SCOP
         s_scope.trigger_cache_trigger_point_index == trigger_point_index &&
         s_scope.trigger_cache_channel_index == trigger_channel_index &&
         s_scope.trigger_cache_mode == trigger_mode;
-
-    trigger_pending =
-        s_scope.trigger_sweep_pending &&
-        s_scope.trigger_monitor_mode == trigger_mode &&
-        s_scope.trigger_monitor_channel_index == trigger_channel_index &&
-        s_scope.trigger_config_requested_samples == requested_samples &&
-        s_scope.trigger_config_trigger_point_index == trigger_point_index &&
-        s_scope.trigger_config_run_mode == trigger_run_mode;
 
     if (trigger_cache_compatible) {
         for (size_t i = 0; i < s_scope.config.channel_count; i++) {
@@ -2215,66 +2132,13 @@ esp_err_t adc_scope_copy_trigger_window_multi(int32_t *dest_per_channel[ADC_SCOP
         return ESP_OK;
     }
 
-    snapshot.trigger_pending = trigger_pending;
-
-    if (trigger_pending && shared_sequence_valid && s_scope.config.channel_count <= 1U) {
-        uint64_t start_seq = 0U;
-        size_t window_len = 0U;
-
-        if (s_scope.trigger_sweep_pending_seq > (uint64_t)pretrigger_samples) {
-            start_seq = s_scope.trigger_sweep_pending_seq - (uint64_t)pretrigger_samples;
-        }
-        if (start_seq < shared_oldest_sequence) {
-            start_seq = shared_oldest_sequence;
-        }
-        if (shared_newest_sequence >= start_seq) {
-            const uint64_t available = (shared_newest_sequence - start_seq) + 1U;
-            window_len = (available > (uint64_t)requested_samples) ? requested_samples : (size_t)available;
-        }
-
-        snapshot.sample_count = window_len;
-        snapshot.trigger_found = (window_len > 0U);
-        snapshot.trigger_sample_index =
-            (s_scope.trigger_sweep_pending_seq >= start_seq) ? (size_t)(s_scope.trigger_sweep_pending_seq - start_seq) : 0U;
-
-        for (size_t i = 0; i < s_scope.config.channel_count; i++) {
-            const uint64_t channel_oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
-            source_window_start[i] = (size_t)(start_seq - channel_oldest_sequence);
-            snapshot.window_start_fp_q10[i] = start_seq * 1024ULL;
-
-            if (dest_per_channel[i] != NULL) {
-                adc_scope_render_window_locked(i,
-                                               true,
-                                               oldest_start[i],
-                                               source_window_start[i],
-                                               window_len,
-                                               requested_samples,
-                                               (uint64_t)source_window_start[i] * 1024ULL,
-                                               dest_per_channel[i],
-                                               point_count,
-                                               &snapshot.min_mv[i],
-                                               &snapshot.max_mv[i]);
-            }
-
-            adc_scope_measure_window_locked(i,
-                                            true,
-                                            oldest_start[i],
-                                            source_window_start[i],
-                                            window_len,
-                                            snapshot.trigger_level_mv,
-                                            &snapshot.frequency_tenths_hz[i],
-                                            &snapshot.duty_tenths_percent[i],
-                                            &snapshot.measurements_valid[i]);
-        }
-
-        xSemaphoreGive(s_scope.mutex);
-
-        if (out_snapshot != NULL) {
-            *out_snapshot = snapshot;
-        }
-
-        return ESP_OK;
-    }
+    snapshot.trigger_pending =
+        s_scope.trigger_sweep_pending &&
+        s_scope.trigger_monitor_mode == trigger_mode &&
+        s_scope.trigger_monitor_channel_index == trigger_channel_index &&
+        s_scope.trigger_config_requested_samples == requested_samples &&
+        s_scope.trigger_config_trigger_point_index == trigger_point_index &&
+        s_scope.trigger_config_run_mode == trigger_run_mode;
 
     xSemaphoreGive(s_scope.mutex);
 
@@ -2643,7 +2507,6 @@ esp_err_t adc_scope_set_active_channel_mode(uint16_t sample_channel_mode)
     s_scope.free_run_history_count = 0U;
     s_scope.trigger_monitor_channel_index = 0U;
     s_scope.trigger_cache_valid = false;
-    s_scope.trigger_sweep_valid = false;
     s_scope.trigger_sweep_pending = false;
     s_scope.trigger_detector_zone = 0;
     s_scope.trigger_last_event_seq = 0U;
