@@ -1830,6 +1830,9 @@ esp_err_t adc_scope_configure_trigger_monitor(size_t trigger_channel_index,
     s_scope.trigger_config_trigger_point_index = trigger_point_index;
     s_scope.trigger_config_run_mode = trigger_run_mode;
     adc_scope_reset_trigger_events_locked();
+    s_scope.trigger_cache_valid = false;
+    s_scope.trigger_sweep_valid = false;
+    s_scope.trigger_sweep_pending = false;
     s_scope.prev_mv_valid[trigger_channel_index] = false;
 
     hysteresis_mv = (int32_t)trigger_hysteresis_mv;
@@ -2059,6 +2062,218 @@ esp_err_t adc_scope_copy_free_run_circular_window_multi(int32_t *dest_per_channe
                                         &snapshot.frequency_tenths_hz[i],
                                         &snapshot.duty_tenths_percent[i],
                                         &snapshot.measurements_valid[i]);
+    }
+
+    xSemaphoreGive(s_scope.mutex);
+
+    if (out_snapshot != NULL) {
+        *out_snapshot = snapshot;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t adc_scope_copy_trigger_window_multi(int32_t *dest_per_channel[ADC_SCOPE_MAX_CHANNELS],
+                                              size_t point_count,
+                                              size_t requested_samples,
+                                              adc_scope_trigger_mode_t trigger_mode,
+                                              adc_scope_trigger_run_mode_t trigger_run_mode,
+                                              size_t trigger_channel_index,
+                                              size_t trigger_point_index,
+                                              int32_t trigger_level_mv,
+                                              uint32_t trigger_hysteresis_mv,
+                                              adc_scope_snapshot_t *out_snapshot)
+{
+    adc_scope_snapshot_t snapshot = {0};
+    bool trigger_cache_compatible = false;
+    bool trigger_pending = false;
+    size_t shared_count = 0U;
+    size_t oldest_start[ADC_SCOPE_MAX_CHANNELS] = {0};
+    size_t source_window_start[ADC_SCOPE_MAX_CHANNELS] = {0};
+    uint64_t shared_oldest_sequence = 0U;
+    uint64_t shared_newest_sequence = 0U;
+    bool shared_sequence_valid = false;
+    size_t pretrigger_samples = 0U;
+
+    ESP_RETURN_ON_FALSE(s_scope.initialized, ESP_ERR_INVALID_STATE, TAG, "modulo nao inicializado");
+    ESP_RETURN_ON_FALSE(dest_per_channel != NULL, ESP_ERR_INVALID_ARG, TAG, "destinos nulos");
+    ESP_RETURN_ON_FALSE(point_count == s_scope.config.chart_point_count, ESP_ERR_INVALID_ARG, TAG, "point_count divergente");
+    ESP_RETURN_ON_FALSE(requested_samples > 0U, ESP_ERR_INVALID_ARG, TAG, "requested_samples invalido");
+    ESP_RETURN_ON_FALSE(trigger_mode != ADC_SCOPE_TRIGGER_FREE, ESP_ERR_INVALID_ARG, TAG, "trigger_mode invalido");
+    ESP_RETURN_ON_FALSE(trigger_channel_index < s_scope.config.channel_count, ESP_ERR_INVALID_ARG, TAG, "trigger_channel_index invalido");
+    ESP_RETURN_ON_FALSE(trigger_point_index < point_count, ESP_ERR_INVALID_ARG, TAG, "trigger_point_index invalido");
+
+    if (xSemaphoreTake(s_scope.mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    shared_count = adc_scope_get_shared_count_locked(true);
+    {
+        const size_t contiguous_count = adc_scope_get_shared_contiguous_tail_count_locked();
+        if (contiguous_count < shared_count) {
+            shared_count = contiguous_count;
+        }
+    }
+
+    snapshot.mode = ADC_SCOPE_MODE_CIRCULAR;
+    snapshot.channel_count = s_scope.config.channel_count;
+    snapshot.capacity = point_count;
+    snapshot.sample_count = 0U;
+    snapshot.history_count = shared_count;
+    snapshot.history_capacity = s_scope.config.circular_buffer_capacity;
+    snapshot.capture_ready = s_scope.block_capture_ready;
+    snapshot.acquisition_running = s_scope.started;
+    snapshot.trigger_found = false;
+    snapshot.trigger_pending = false;
+    snapshot.overflow_seen = s_scope.overflow_seen;
+    snapshot.trigger_channel_index = trigger_channel_index;
+    snapshot.trigger_level_mv = (trigger_level_mv == INT32_MIN) ? 0 : trigger_level_mv;
+    snapshot.trigger_hysteresis_mv = trigger_hysteresis_mv;
+    snapshot.trigger_sample_index = 0U;
+
+    for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+        snapshot.latest_sequence[i] = s_scope.sample_sequence[i];
+        snapshot.window_start_fp_q10[i] = 0U;
+        snapshot.latest_raw[i] = s_scope.latest_raw[i];
+        snapshot.latest_mv[i] = s_scope.latest_mv[i];
+        snapshot.min_mv[i] = 0;
+        snapshot.max_mv[i] = 0;
+        snapshot.frequency_tenths_hz[i] = 0U;
+        snapshot.duty_tenths_percent[i] = 0U;
+        snapshot.measurements_valid[i] = false;
+        snapshot.calibrated[i] = s_scope.calibrated[i];
+        oldest_start[i] =
+            (s_scope.circular_head[i] + s_scope.config.circular_buffer_capacity - s_scope.circular_count[i]) %
+            s_scope.config.circular_buffer_capacity;
+        if (s_scope.circular_count[i] > 0U) {
+            const uint64_t channel_oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
+            const uint64_t channel_newest_sequence = s_scope.sample_sequence[i];
+
+            if (!shared_sequence_valid) {
+                shared_oldest_sequence = channel_oldest_sequence;
+                shared_newest_sequence = channel_newest_sequence;
+                shared_sequence_valid = true;
+            } else {
+                if (channel_oldest_sequence > shared_oldest_sequence) {
+                    shared_oldest_sequence = channel_oldest_sequence;
+                }
+                if (channel_newest_sequence < shared_newest_sequence) {
+                    shared_newest_sequence = channel_newest_sequence;
+                }
+            }
+        }
+    }
+
+    if (point_count > 1U) {
+        pretrigger_samples =
+            ((requested_samples - 1U) * trigger_point_index) / (point_count - 1U);
+    }
+
+    trigger_cache_compatible =
+        s_scope.trigger_cache_valid &&
+        s_scope.trigger_cache_requested_samples == requested_samples &&
+        s_scope.trigger_cache_trigger_point_index == trigger_point_index &&
+        s_scope.trigger_cache_channel_index == trigger_channel_index &&
+        s_scope.trigger_cache_mode == trigger_mode;
+
+    trigger_pending =
+        s_scope.trigger_sweep_pending &&
+        s_scope.trigger_monitor_mode == trigger_mode &&
+        s_scope.trigger_monitor_channel_index == trigger_channel_index &&
+        s_scope.trigger_config_requested_samples == requested_samples &&
+        s_scope.trigger_config_trigger_point_index == trigger_point_index &&
+        s_scope.trigger_config_run_mode == trigger_run_mode;
+
+    if (trigger_cache_compatible) {
+        for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+            if (dest_per_channel[i] != NULL) {
+                memcpy(dest_per_channel[i],
+                       s_scope.trigger_cache_points[i],
+                       point_count * sizeof(int32_t));
+            }
+        }
+
+        snapshot = s_scope.trigger_cache_snapshot;
+        snapshot.history_count = shared_count;
+        snapshot.history_capacity = s_scope.config.circular_buffer_capacity;
+        snapshot.capture_ready = s_scope.block_capture_ready;
+        snapshot.acquisition_running = s_scope.started;
+        snapshot.overflow_seen = s_scope.overflow_seen;
+        snapshot.trigger_pending = false;
+        for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+            snapshot.latest_sequence[i] = s_scope.sample_sequence[i];
+            snapshot.latest_raw[i] = s_scope.latest_raw[i];
+            snapshot.latest_mv[i] = s_scope.latest_mv[i];
+            snapshot.calibrated[i] = s_scope.calibrated[i];
+        }
+
+        xSemaphoreGive(s_scope.mutex);
+
+        if (out_snapshot != NULL) {
+            *out_snapshot = snapshot;
+        }
+        return ESP_OK;
+    }
+
+    snapshot.trigger_pending = trigger_pending;
+
+    if (trigger_pending && shared_sequence_valid && s_scope.config.channel_count <= 1U) {
+        uint64_t start_seq = 0U;
+        size_t window_len = 0U;
+
+        if (s_scope.trigger_sweep_pending_seq > (uint64_t)pretrigger_samples) {
+            start_seq = s_scope.trigger_sweep_pending_seq - (uint64_t)pretrigger_samples;
+        }
+        if (start_seq < shared_oldest_sequence) {
+            start_seq = shared_oldest_sequence;
+        }
+        if (shared_newest_sequence >= start_seq) {
+            const uint64_t available = (shared_newest_sequence - start_seq) + 1U;
+            window_len = (available > (uint64_t)requested_samples) ? requested_samples : (size_t)available;
+        }
+
+        snapshot.sample_count = window_len;
+        snapshot.trigger_found = (window_len > 0U);
+        snapshot.trigger_sample_index =
+            (s_scope.trigger_sweep_pending_seq >= start_seq) ? (size_t)(s_scope.trigger_sweep_pending_seq - start_seq) : 0U;
+
+        for (size_t i = 0; i < s_scope.config.channel_count; i++) {
+            const uint64_t channel_oldest_sequence = s_scope.sample_sequence[i] - (s_scope.circular_count[i] - 1U);
+            source_window_start[i] = (size_t)(start_seq - channel_oldest_sequence);
+            snapshot.window_start_fp_q10[i] = start_seq * 1024ULL;
+
+            if (dest_per_channel[i] != NULL) {
+                adc_scope_render_window_locked(i,
+                                               true,
+                                               oldest_start[i],
+                                               source_window_start[i],
+                                               window_len,
+                                               requested_samples,
+                                               (uint64_t)source_window_start[i] * 1024ULL,
+                                               dest_per_channel[i],
+                                               point_count,
+                                               &snapshot.min_mv[i],
+                                               &snapshot.max_mv[i]);
+            }
+
+            adc_scope_measure_window_locked(i,
+                                            true,
+                                            oldest_start[i],
+                                            source_window_start[i],
+                                            window_len,
+                                            snapshot.trigger_level_mv,
+                                            &snapshot.frequency_tenths_hz[i],
+                                            &snapshot.duty_tenths_percent[i],
+                                            &snapshot.measurements_valid[i]);
+        }
+
+        xSemaphoreGive(s_scope.mutex);
+
+        if (out_snapshot != NULL) {
+            *out_snapshot = snapshot;
+        }
+
+        return ESP_OK;
     }
 
     xSemaphoreGive(s_scope.mutex);

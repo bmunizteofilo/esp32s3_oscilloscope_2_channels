@@ -445,6 +445,9 @@ static uint8_t s_capture_resume_settle_refreshes = 0U;
 
 /** @brief Indica que, após retomar a captura, a tela deve esperar uma janela contínua completa antes de atualizar. */
 static bool s_capture_resume_wait_full_window = false;
+static bool s_trigger_display_valid = false;
+static bool s_trigger_rearm_pending = false;
+static int64_t s_trigger_rearm_deadline_us = 0;
 
 /** @brief Quando verdadeiro, o pause congela exatamente a imagem atual sem redesenhar. */
 static bool s_pause_display_locked = false;
@@ -629,6 +632,8 @@ static void lvgl_set_center_notice(const char *text);
 static void lvgl_hold_center_notice(uint32_t hold_ms);
 static void lvgl_update_trigger_channel_dropdown_options(void);
 static void lvgl_apply_adc_channel_mode(bool show_notice);
+static void lvgl_invalidate_trigger_display(bool clear_chart);
+static void lvgl_begin_trigger_rearm(uint32_t timeout_ms);
 
 /**
  * @brief Atualiza a linha e o label visuais do nível de trigger.
@@ -861,6 +866,9 @@ static uint32_t lvgl_get_target_sample_freq_hz(void)
     if (time_per_div_us >= 250000U) {
         return 15000U;
     }
+    if (time_per_div_us >= 100000U) {
+        return 10000U;
+    }
     return 40000U;
 }
 
@@ -920,6 +928,7 @@ static void lvgl_restart_history_for_timebase_change(void)
     s_history_block_offset = 0U;
     lvgl_sync_free_run_block_config();
     lvgl_reset_free_run_sweep();
+    lvgl_invalidate_trigger_display(lvgl_get_active_trigger_mode() != ADC_SCOPE_TRIGGER_FREE);
 }
 
 /**
@@ -2372,6 +2381,97 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
                                                           &next_snapshot) != ESP_OK) {
             return;
         }
+    } else if (!s_scope_paused) {
+        if (adc_scope_copy_trigger_window_multi(dest_buffers,
+                                                APP_ADC_CHART_POINTS,
+                                                requested_samples,
+                                                active_trigger_mode,
+                                                active_trigger_run_mode,
+                                                s_trigger_channel_index,
+                                                LVGL_SCOPE_TRIGGER_POS,
+                                                s_trigger_level_mv,
+                                                0U,
+                                                &next_snapshot) != ESP_OK) {
+            return;
+        }
+
+        if (!next_snapshot.trigger_found) {
+            if (active_trigger_run_mode != ADC_SCOPE_TRIGGER_RUN_AUTO) {
+                if (!s_trigger_display_valid) {
+                    lvgl_reset_free_run_sweep();
+                }
+                s_scope_snapshot = next_snapshot;
+                lvgl_update_grid_scale_labels();
+                lvgl_update_buffer_label();
+                lvgl_update_trigger_level_visuals();
+                lvgl_update_cursor_visuals();
+                return;
+            }
+
+            if (next_snapshot.trigger_pending) {
+                s_trigger_rearm_pending = false;
+                s_trigger_rearm_deadline_us = 0;
+                if (!s_trigger_display_valid) {
+                    s_scope_snapshot = next_snapshot;
+                    lvgl_update_grid_scale_labels();
+                    lvgl_update_buffer_label();
+                    lvgl_update_trigger_level_visuals();
+                    lvgl_update_cursor_visuals();
+                }
+                return;
+            }
+
+            if (s_trigger_rearm_pending) {
+                if (esp_timer_get_time() < s_trigger_rearm_deadline_us) {
+                    s_scope_snapshot = next_snapshot;
+                    lvgl_update_grid_scale_labels();
+                    lvgl_update_buffer_label();
+                    lvgl_update_trigger_level_visuals();
+                    lvgl_update_cursor_visuals();
+                    return;
+                }
+
+                s_trigger_rearm_pending = false;
+                s_trigger_rearm_deadline_us = 0;
+            }
+
+            reference_channel = lvgl_get_free_run_reference_channel();
+            if (adc_scope_get_circular_status(reference_channel,
+                                              &latest_sequence,
+                                              &shared_history_count) != ESP_OK) {
+                return;
+            }
+            if (shared_history_count == 0U) {
+                return;
+            }
+
+            if (!s_free_run_sweep_active ||
+                s_free_run_last_requested_samples != requested_samples ||
+                s_free_run_last_channel_mode != s_sample_channel_mode) {
+                s_free_run_sweep_active = true;
+                s_free_run_last_requested_samples = requested_samples;
+                s_free_run_last_channel_mode = s_sample_channel_mode;
+                s_free_run_display_end_sequence = latest_sequence;
+            } else if (latest_sequence > s_free_run_display_end_sequence) {
+                const size_t step_samples =
+                    (requested_samples >= LVGL_SCOPE_TIME_DIVS) ? (requested_samples / LVGL_SCOPE_TIME_DIVS) : 1U;
+                const uint64_t delta_seq = latest_sequence - s_free_run_display_end_sequence;
+                const uint64_t steps = delta_seq / (uint64_t)step_samples;
+                if (steps > 0U) {
+                    s_free_run_display_end_sequence += steps * (uint64_t)step_samples;
+                }
+            }
+
+            if (adc_scope_copy_free_run_circular_window_multi(dest_buffers,
+                                                              APP_ADC_CHART_POINTS,
+                                                              requested_samples,
+                                                              s_free_run_display_end_sequence,
+                                                              s_trigger_level_mv,
+                                                              &next_snapshot) != ESP_OK) {
+                return;
+            }
+            s_trigger_display_valid = false;
+        }
     } else {
         if (adc_scope_copy_chart_points_multi(dest_buffers,
                                               APP_ADC_CHART_POINTS,
@@ -2399,22 +2499,15 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
         s_capture_resume_wait_full_window = false;
     }
 
-    if (active_trigger_mode != ADC_SCOPE_TRIGGER_FREE &&
-        active_trigger_run_mode != ADC_SCOPE_TRIGGER_RUN_AUTO &&
-        !next_snapshot.trigger_found) {
-        lvgl_reset_free_run_sweep();
-        s_scope_snapshot = next_snapshot;
-        lvgl_update_grid_scale_labels();
-        lvgl_update_buffer_label();
-        lvgl_update_trigger_level_visuals();
-        lvgl_update_cursor_visuals();
-        return;
-    }
-
     lvgl_reset_free_run_sweep();
     lvgl_publish_pending_points_full();
 
     s_scope_snapshot = next_snapshot;
+    if (active_trigger_mode != ADC_SCOPE_TRIGGER_FREE && next_snapshot.trigger_found) {
+        s_trigger_display_valid = true;
+        s_trigger_rearm_pending = false;
+        s_trigger_rearm_deadline_us = 0;
+    }
 
     lv_chart_set_axis_range(s_scope_chart, LV_CHART_AXIS_PRIMARY_Y, 0, lvgl_get_chart_y_max_mv());
     lv_chart_refresh(s_scope_chart);
@@ -2495,6 +2588,32 @@ static void lvgl_reset_free_run_sweep(void)
     lvgl_invalidate_free_run_state(true);
 }
 
+static void lvgl_invalidate_trigger_display(bool clear_chart)
+{
+    s_trigger_display_valid = false;
+    if (clear_chart) {
+        for (size_t i = 0; i < APP_ADC_CHART_POINTS; i++) {
+            s_chart_points[i] = INT32_MAX;
+            s_chart_points_ch2[i] = INT32_MAX;
+        }
+        if (s_scope_chart != NULL) {
+            lv_chart_refresh(s_scope_chart);
+        }
+    }
+}
+
+static void lvgl_begin_trigger_rearm(uint32_t timeout_ms)
+{
+    if (s_scope_paused || lvgl_get_active_trigger_mode() == ADC_SCOPE_TRIGGER_FREE) {
+        s_trigger_rearm_pending = false;
+        s_trigger_rearm_deadline_us = 0;
+        return;
+    }
+
+    s_trigger_rearm_pending = true;
+    s_trigger_rearm_deadline_us = esp_timer_get_time() + ((int64_t)timeout_ms * 1000LL);
+}
+
 /**
  * @brief Inicializa o estado da varredura livre já com a tela cheia.
  *
@@ -2547,6 +2666,8 @@ static void lvgl_trigger_channel_dropdown_event_cb(lv_event_t *e)
     }
 
     lvgl_sync_adc_trigger_monitor();
+    lvgl_invalidate_trigger_display(false);
+    lvgl_begin_trigger_rearm(1200U);
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2647,6 +2768,8 @@ static void lvgl_timebase_dropdown_event_cb(lv_event_t *e)
         lvgl_restart_history_for_timebase_change();
     }
     lvgl_sync_adc_trigger_monitor();
+    lvgl_invalidate_trigger_display(false);
+    lvgl_begin_trigger_rearm(1200U);
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2713,6 +2836,8 @@ static void lvgl_trigger_dropdown_event_cb(lv_event_t *e)
     }
     lvgl_update_trigger_level_visuals();
     lvgl_sync_adc_trigger_monitor();
+    lvgl_invalidate_trigger_display(false);
+    lvgl_begin_trigger_rearm(1200U);
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2755,6 +2880,8 @@ static void lvgl_trigger_run_dropdown_event_cb(lv_event_t *e)
         lvgl_update_trigger_level_visuals();
     }
     lvgl_sync_adc_trigger_monitor();
+    lvgl_invalidate_trigger_display(false);
+    lvgl_begin_trigger_rearm(1200U);
     lvgl_publish_control_state();
     lvgl_scope_refresh_timer_cb(NULL);
 }
@@ -2905,6 +3032,8 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
 
         if (!s_scope_paused && lvgl_get_active_trigger_mode() != ADC_SCOPE_TRIGGER_FREE) {
             lvgl_sync_adc_trigger_monitor();
+            lvgl_invalidate_trigger_display(false);
+            lvgl_begin_trigger_rearm(1200U);
         }
         return;
     }

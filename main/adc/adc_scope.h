@@ -92,6 +92,7 @@ typedef struct {
     bool capture_ready;                                     /**< Indica se a última captura em bloco foi concluída. */
     bool acquisition_running;                               /**< Indica se a aquisição contínua está em execução. */
     bool trigger_found;                                     /**< Indica se a janela atual foi ancorada por um trigger válido. */
+    bool trigger_pending;                                   /**< Indica se já existe evento de trigger aguardando sweep completa. */
     bool overflow_seen;                                     /**< Indica se houve overflow do pool interno desde a inicialização. */
 } adc_scope_snapshot_t;
 
@@ -195,6 +196,17 @@ esp_err_t adc_scope_copy_free_run_circular_window_multi(int32_t *dest_per_channe
                                                         uint64_t display_end_sequence,
                                                         int32_t trigger_level_mv,
                                                         adc_scope_snapshot_t *out_snapshot);
+
+esp_err_t adc_scope_copy_trigger_window_multi(int32_t *dest_per_channel[ADC_SCOPE_MAX_CHANNELS],
+                                              size_t point_count,
+                                              size_t requested_samples,
+                                              adc_scope_trigger_mode_t trigger_mode,
+                                              adc_scope_trigger_run_mode_t trigger_run_mode,
+                                              size_t trigger_channel_index,
+                                              size_t trigger_point_index,
+                                              int32_t trigger_level_mv,
+                                              uint32_t trigger_hysteresis_mv,
+                                              adc_scope_snapshot_t *out_snapshot);
 
 /**
  * @brief Limpa o histórico atual de captura e invalida sweeps/cache dependentes.
