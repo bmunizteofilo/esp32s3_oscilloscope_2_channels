@@ -1930,7 +1930,10 @@ static void lvgl_update_trigger_level_visuals(void)
         return;
     }
 
-    if (esp_timer_get_time() >= s_trigger_visual_hold_until_us) {
+    if (!(s_scope_paused &&
+          s_trigger_run_mode == ADC_SCOPE_TRIGGER_RUN_SINGLE &&
+          s_scope_snapshot.trigger_found) &&
+        esp_timer_get_time() >= s_trigger_visual_hold_until_us) {
         lv_obj_add_flag(s_trigger_level_line, LV_OBJ_FLAG_HIDDEN);
         if (s_trigger_level_label != NULL) {
             lv_obj_add_flag(s_trigger_level_label, LV_OBJ_FLAG_HIDDEN);
@@ -2394,7 +2397,8 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
 
         if (!next_snapshot.trigger_found) {
             if (active_trigger_run_mode != ADC_SCOPE_TRIGGER_RUN_AUTO) {
-                if (!s_trigger_display_valid) {
+                if (!s_trigger_display_valid &&
+                    active_trigger_run_mode == ADC_SCOPE_TRIGGER_RUN_SINGLE) {
                     lvgl_reset_free_run_sweep();
                 }
                 s_scope_snapshot = next_snapshot;
@@ -2495,13 +2499,24 @@ static void lvgl_scope_refresh_timer_cb(lv_timer_t *timer)
         active_trigger_mode != ADC_SCOPE_TRIGGER_FREE &&
         active_trigger_run_mode == ADC_SCOPE_TRIGGER_RUN_SINGLE &&
         s_scope_snapshot.trigger_found) {
-        if (adc_scope_stop() == ESP_OK) {
-            s_scope_paused = true;
-            s_history_offset_samples = 0U;
-            if (s_status_dropdown != NULL) {
-                lv_dropdown_set_selected(s_status_dropdown, 1U);
-            }
+        s_scope_paused = true;
+        s_history_offset_samples = 0U;
+        s_history_block_offset = 0U;
+        s_pause_uses_block_history = false;
+        (void)adc_scope_freeze_history_snapshot();
+        s_pause_anchor_channel = 0U;
+        s_pause_anchor_sequence =
+            (s_pause_anchor_channel < ADC_SCOPE_MAX_CHANNELS) ?
+                s_scope_snapshot.latest_sequence[s_pause_anchor_channel] : 0U;
+        s_pause_display_locked = true;
+        s_capture_resume_settle_refreshes = 0U;
+        s_capture_resume_wait_full_window = false;
+        if (s_status_dropdown != NULL) {
+            s_suppress_dropdown_events = true;
+            lv_dropdown_set_selected(s_status_dropdown, 1U);
+            s_suppress_dropdown_events = false;
         }
+        (void)adc_scope_stop();
     }
 }
 
@@ -2567,6 +2582,38 @@ static void lvgl_invalidate_trigger_display(bool clear_chart)
         if (s_scope_chart != NULL) {
             lv_chart_refresh(s_scope_chart);
         }
+    }
+}
+
+static void lvgl_resume_capture_after_pause(void)
+{
+    esp_err_t start_err = ESP_OK;
+    const adc_scope_trigger_mode_t active_trigger_mode = lvgl_get_active_trigger_mode();
+    const adc_scope_trigger_run_mode_t active_trigger_run_mode = s_trigger_run_mode;
+
+    s_history_offset_samples = 0U;
+    s_history_block_offset = 0U;
+    s_scope_paused = false;
+    s_pause_uses_block_history = false;
+    (void)adc_scope_release_history_snapshot();
+    s_pause_anchor_sequence = 0U;
+    s_pause_display_locked = false;
+    lvgl_invalidate_free_run_state(false);
+    s_capture_resume_settle_refreshes = 0U;
+    s_capture_resume_wait_full_window = false;
+
+    if (active_trigger_mode != ADC_SCOPE_TRIGGER_FREE) {
+        lvgl_sync_adc_trigger_monitor();
+        lvgl_invalidate_trigger_display(false);
+    }
+
+    start_err = adc_scope_start();
+    if (start_err != ESP_OK && start_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Falha ao retomar captura apos pause: %s", esp_err_to_name(start_err));
+    }
+
+    if (active_trigger_run_mode == ADC_SCOPE_TRIGGER_RUN_SINGLE) {
+        lvgl_scope_refresh_timer_cb(NULL);
     }
 }
 
@@ -2803,6 +2850,7 @@ static void lvgl_trigger_dropdown_event_cb(lv_event_t *e)
 static void lvgl_trigger_run_dropdown_event_cb(lv_event_t *e)
 {
     uint16_t selected = 0;
+    const adc_scope_trigger_run_mode_t previous_mode = s_trigger_run_mode;
 
     if (s_suppress_dropdown_events) {
         return;
@@ -2831,6 +2879,14 @@ static void lvgl_trigger_run_dropdown_event_cb(lv_event_t *e)
     } else {
         s_trigger_visual_hold_until_us = 0;
         lvgl_update_trigger_level_visuals();
+        if (s_scope_paused && previous_mode == ADC_SCOPE_TRIGGER_RUN_SINGLE) {
+            lvgl_resume_capture_after_pause();
+            if (s_status_dropdown != NULL) {
+                s_suppress_dropdown_events = true;
+                lv_dropdown_set_selected(s_status_dropdown, 0U);
+                s_suppress_dropdown_events = false;
+            }
+        }
     }
     lvgl_sync_adc_trigger_monitor();
     lvgl_invalidate_trigger_display(false);
@@ -2855,16 +2911,7 @@ static void lvgl_status_dropdown_event_cb(lv_event_t *e)
     }
 
     if (selected == 0U) {
-        s_history_offset_samples = 0U;
-        s_history_block_offset = 0U;
-        s_scope_paused = false;
-        s_pause_uses_block_history = false;
-        (void)adc_scope_release_history_snapshot();
-        s_pause_anchor_sequence = 0U;
-        s_pause_display_locked = false;
-        lvgl_invalidate_free_run_state(false);
-        s_capture_resume_settle_refreshes = 0U;
-        s_capture_resume_wait_full_window = false;
+        lvgl_resume_capture_after_pause();
     } else {
         s_scope_paused = true;
         s_history_offset_samples = 0U;
@@ -2995,6 +3042,7 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
         lv_area_t content_coords = {0};
         size_t max_offset = 0U;
         int32_t delta_x = 0;
+        int32_t delta_y = 0;
         size_t delta_samples = 0U;
         int32_t local_x = 0;
         int32_t local_y = 0;
@@ -3008,6 +3056,7 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
         local_x = point.x - content_coords.x1;
         local_y = point.y - content_coords.y1;
         delta_x = (int32_t)point.x - (int32_t)s_drag_start_x;
+        delta_y = (int32_t)point.y - (int32_t)s_drag_start_y;
 
         if (s_cursor_mode != LVGL_CURSOR_MODE_OFF && s_cursor_drag_active) {
             if (s_cursor_mode == LVGL_CURSOR_MODE_TIME) {
@@ -3046,7 +3095,10 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
             return;
         }
 
-        if (!s_scope_paused && lvgl_get_active_trigger_mode() != ADC_SCOPE_TRIGGER_FREE) {
+        if (((!s_scope_paused) && lvgl_get_active_trigger_mode() != ADC_SCOPE_TRIGGER_FREE) ||
+            (s_scope_paused &&
+             s_trigger_run_mode == ADC_SCOPE_TRIGGER_RUN_SINGLE &&
+             ((delta_y >= 0 ? delta_y : -delta_y) >= (delta_x >= 0 ? delta_x : -delta_x)))) {
             int32_t new_trigger_level_mv = 0;
 
             if (height_px == 0U) {
@@ -3067,6 +3119,14 @@ static void lvgl_scope_chart_event_cb(lv_event_t *e)
             }
             s_trigger_level_mv = new_trigger_level_mv;
             lvgl_hold_trigger_visual(LVGL_TRIGGER_VISUAL_HOLD_MS);
+            if (s_scope_paused && s_trigger_run_mode == ADC_SCOPE_TRIGGER_RUN_SINGLE) {
+                lvgl_sync_adc_trigger_monitor();
+                lvgl_invalidate_trigger_display(false);
+                lvgl_update_trigger_level_visuals();
+                lvgl_publish_control_state();
+                s_pause_display_locked = false;
+                return;
+            }
             lvgl_scope_refresh_timer_cb(NULL);
             return;
         }
